@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id             Int           @id @default(autoincrement())
+  name           String
+  iban           String?       @unique
+  account_number String?       @unique
+  bank           String
+  account_type   String        @default("checking")
+  created_at     String?
+  transactions   Transaction[]
+
+  @@map("accounts")
+}
+
+model Transaction {
+  id             Int      @id @default(autoincrement())
+  account_number String?
+  bu_date        String?
+  value_date     String?
+  type           String?
+  description    String?
+  counterparty   String?
+  amount         Float?
+  direction      String?
+  category       String?
+  source_file    String?
+  hash           String?  @unique(map: "sqlite_autoindex_transactions_1")
+  account_id     Int?
+  account        Account? @relation(fields: [account_id], references: [id])
+
+  @@map("transactions")
+}
+
+model CategoryRule {
+  id          Int     @id @default(autoincrement())
+  category    String
+  pattern     String
+  match_field String  @default("description")
+  match_type  String  @default("regex")
+  priority    Int     @default(100)
+  is_default  Boolean @default(false)
+  created_at  String?
+
+  @@map("category_rules")
+}
+
+model ImportLog {
+  id               Int     @id @default(autoincrement())
+  filename         String?
+  imported_at      String?
+  records_imported Int?
+  records_skipped  Int?
+
+  @@map("import_log")
+}
