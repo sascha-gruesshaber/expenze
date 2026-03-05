@@ -3,6 +3,8 @@ import { useState } from 'react';
 import { Sidebar } from '../components/layout/Sidebar';
 import { Topbar } from '../components/layout/Topbar';
 import { FilterContext, type FilterState } from '../lib/filterContext';
+import { BatchCategorizationDialog } from '../components/categories/BatchCategorizationDialog';
+import { BatchFloatingIndicator } from '../components/layout/BatchFloatingIndicator';
 
 export const Route = createRootRoute({
   component: RootLayout,
@@ -22,6 +24,8 @@ function RootLayout() {
           </div>
         </main>
       </div>
+      <BatchCategorizationDialog />
+      <BatchFloatingIndicator />
     </FilterContext.Provider>
   );
 }

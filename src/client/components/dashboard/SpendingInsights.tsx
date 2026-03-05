@@ -26,7 +26,12 @@ const colorClasses = {
 export function SpendingInsights({ monthly, categories, income, expenses }: SpendingInsightsProps) {
   const insights: Insight[] = [];
 
-  const savingsRate = income > 0 ? ((income - expenses) / income) * 100 : 0;
+  const savingsTotal = categories
+    .filter(c => c.category_type === 'savings')
+    .reduce((s, c) => s + (Number(c.total) || 0), 0);
+  const savingsRate = income > 0
+    ? (savingsTotal > 0 ? (savingsTotal / income) * 100 : ((income - expenses) / income) * 100)
+    : 0;
   if (savingsRate > 20) {
     insights.push({
       icon: <Sparkles size={15} />,

@@ -45,6 +45,45 @@ body {
   vertical-align: middle;
 }
 
+/* File import animations */
+@keyframes fadeSlideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-slide-up {
+  animation: fadeSlideUp 0.3s ease-out both;
+}
+
+/* Dialog minimize animation — flies to floating indicator */
+@keyframes dialogMinimize {
+  0% { opacity: 1; transform: translate(0, 0) scale(1); border-radius: 1rem; }
+  100% { opacity: 0; transform: translate(var(--min-dx, 0px), var(--min-dy, 30vh)) scale(0.08); border-radius: 3rem; }
+}
+.animate-dialog-minimize {
+  animation: dialogMinimize 0.35s cubic-bezier(0.4, 0, 0.7, 0.2) forwards;
+  pointer-events: none;
+}
+@keyframes backdropFadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+.animate-backdrop-fade-out {
+  animation: backdropFadeOut 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Filter dropdown animation */
+@keyframes dropdownIn {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-dropdown {
+  animation: dropdownIn 0.15s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Hide scrollbar for horizontal scroll */
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
 /* Selection */
 ::selection {
   background: rgba(13, 147, 115, 0.15);

@@ -1,12 +1,14 @@
 import { Link, useLocation } from '@tanstack/react-router';
-import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2 } from 'lucide-react';
+import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2, BarChart2 } from 'lucide-react';
 import { useSummary } from '../../api/hooks';
 import { fmtDate } from '../../lib/format';
 import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
+import { AiModelSwitcher } from './AiModelSwitcher';
 
 const navItems = [
   { to: '/dashboard' as const, icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/analytics' as const, icon: BarChart2, label: 'Analyse' },
   { to: '/transactions' as const, icon: ArrowLeftRight, label: 'Transaktionen' },
   { to: '/accounts' as const, icon: Landmark, label: 'Konten' },
   { to: '/categories' as const, icon: Tag, label: 'Kategorien' },
@@ -74,6 +76,9 @@ export function Sidebar() {
         ) : (
           <div className="text-[12px] text-text-3">Keine Daten</div>
         )}
+      </div>
+      <div className="px-3 pb-1">
+        <AiModelSwitcher />
       </div>
       <div className="px-3 pb-4">
         <button

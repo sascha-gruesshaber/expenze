@@ -1,5 +1,5 @@
 import type { BankParser, ParsedTransaction } from './types.js';
-import { categorize, parseAmount, parseDate, computeHash } from './types.js';
+import { categorize, parseAmount, parseDate, computeHash, extractCounterpartyIban } from './types.js';
 
 function extractIban(text: string): string | null {
   const m = text.match(/IBAN:\s*(DE\d{20})/);
@@ -53,11 +53,14 @@ export const c24Parser: BankParser = {
       const amount = parseAmount(match[6]);
       const direction: 'credit' | 'debit' = sign === '+' ? 'credit' : 'debit';
 
+      // Extract counterparty IBAN from details
+      let counterpartyIban: string | null = null;
+      const ibanIdx = details.indexOf('IBAN:');
       // Extract counterparty: text before IBAN reference or full details
       let counterparty: string;
-      const ibanIdx = details.indexOf('IBAN:');
       if (ibanIdx > 0) {
         counterparty = details.substring(0, ibanIdx).trim();
+        counterpartyIban = extractCounterpartyIban(details.substring(ibanIdx));
       } else {
         counterparty = details;
       }
@@ -87,6 +90,7 @@ export const c24Parser: BankParser = {
         type,
         description: fullDesc,
         counterparty,
+        counterparty_iban: counterpartyIban,
         amount,
         direction,
         category,

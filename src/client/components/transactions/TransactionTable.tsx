@@ -56,6 +56,9 @@ export function TransactionTable({ transactions }: TransactionTableProps) {
             </td>
             <td className="px-4 py-3 border-b border-border/60 text-[13px]">
               <div className="font-medium text-text">{tx.counterparty || '\u2014'}</div>
+              {tx.counterparty_iban && (
+                <div className="text-[11px] text-text-3 font-mono tracking-wide">{tx.counterparty_iban}</div>
+              )}
               <div className="text-[12px] text-text-3 max-w-[400px] overflow-hidden text-ellipsis whitespace-nowrap">
                 {tx.description || ''}
               </div>

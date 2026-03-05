@@ -1,5 +1,5 @@
 import type { BankParser, ParsedTransaction } from './types.js';
-import { categorize, parseAmount, parseDate, computeHash } from './types.js';
+import { categorize, parseAmount, parseDate, computeHash, extractCounterpartyIban } from './types.js';
 
 function extractIban(text: string): string | null {
   const m = text.match(/IBAN:\s*(DE\d{2}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{2})/);
@@ -58,6 +58,7 @@ export const volksbankParser: BankParser = {
       const rest = match[6].trim();
 
       const restClean = rest.replace(/\s+/g, ' ').trim();
+      const counterpartyIban = extractCounterpartyIban(restClean);
       const cpMatch = restClean.match(/^(.+?)(?:\s+(?:EREF|MREF|CRED|IBAN|REF|ELV|\d{6,}|PK-Nr|Rechnung|Kunden|BELEG|Abschluss|Teilzahlung|Guth\.).*)?$/s);
       const counterparty = cpMatch ? cpMatch[1].trim().substring(0, 100) : restClean.substring(0, 80);
 
@@ -74,6 +75,7 @@ export const volksbankParser: BankParser = {
         type,
         description: fullDesc,
         counterparty,
+        counterparty_iban: counterpartyIban,
         amount,
         direction,
         category,

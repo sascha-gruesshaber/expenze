@@ -1,6 +1,81 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, apiPost, apiPatch, apiDelete } from './client';
 
+// ── AI Model Settings ───────────────────────────────────────────────
+
+export interface AiModelSettings {
+  current: string;
+  presets: { id: string; label: string }[];
+  freeModel: { id: string; label: string };
+  custom: string[];
+  hasApiKey: boolean;
+  zdrModelIds: string[];
+  availableModelIds: string[];
+}
+
+export function useAiModel() {
+  return useQuery<AiModelSettings>({
+    queryKey: ['aiModel'],
+    queryFn: () => apiFetch('/settings/ai-model'),
+  });
+}
+
+export function useSetAiModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (model: string) =>
+      apiPatch<{ success: boolean }>('/settings/ai-model', { model }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['aiModel'] }),
+  });
+}
+
+export function useAddCustomModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (model: string) =>
+      apiPost<{ success: boolean }>('/settings/ai-model/custom', { model }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['aiModel'] }),
+  });
+}
+
+export function useRemoveCustomModel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (model: string) =>
+      apiFetch<{ success: boolean }>('/settings/ai-model/custom', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['aiModel'] }),
+  });
+}
+
+export interface BrowseModel {
+  id: string;
+  name: string;
+  isFree: boolean;
+  promptPrice: number;
+  completionPrice: number;
+  contextLength: number;
+  provider: string;
+  supportsZdr: boolean;
+}
+
+export interface BrowseModelsResponse {
+  models: BrowseModel[];
+  providers: string[];
+}
+
+export function useModelBrowser(enabled: boolean) {
+  return useQuery<BrowseModelsResponse>({
+    queryKey: ['modelBrowser'],
+    queryFn: () => apiFetch('/settings/ai-model/browse'),
+    enabled,
+    staleTime: 60 * 60 * 1000,
+  });
+}
+
 // Types
 export interface Transaction {
   id: number;
@@ -14,6 +89,7 @@ export interface Transaction {
   direction: string | null;
   category: string | null;
   source_file: string | null;
+  counterparty_iban: string | null;
   hash: string | null;
   account_id: number | null;
   bank_name: string | null;
@@ -30,6 +106,7 @@ export interface CategoryData {
   category: string;
   total: number;
   count: number;
+  category_type: 'default' | 'savings';
 }
 
 export interface SummaryData {
@@ -73,6 +150,9 @@ export interface CategoryRule {
 
 export interface CategoryOverview {
   category: string;
+  category_id: number;
+  is_default: boolean;
+  category_type: 'default' | 'savings';
   tx_count: number;
   total_debit: number;
   total_credit: number;
@@ -239,10 +319,16 @@ export function useCategoryRules() {
   });
 }
 
-export function useCategoryOverview() {
+export function useCategoryOverview(filters?: { year?: string; month?: string; account?: string }) {
+  const params = new URLSearchParams();
+  if (filters?.year) params.set('year', filters.year);
+  if (filters?.month) params.set('month', filters.month);
+  if (filters?.account) accountParams(params, filters.account);
+  const qs = params.toString();
+
   return useQuery<CategoryOverview[]>({
-    queryKey: ['categoryOverview'],
-    queryFn: () => apiFetch('/categories/overview'),
+    queryKey: ['categoryOverview', filters?.year || '', filters?.month || '', filters?.account || ''],
+    queryFn: () => apiFetch(`/categories/overview${qs ? `?${qs}` : ''}`),
   });
 }
 
@@ -281,6 +367,48 @@ export function useDeleteCategoryRule() {
   });
 }
 
+export function useCreateCategory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiPost<{ id: number; name: string }>('/categories', { name }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['categoryList'] });
+      qc.invalidateQueries({ queryKey: ['categoryOverview'] });
+    },
+  });
+}
+
+export function useUpdateCategoryMeta() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: number; name?: string; category_type?: 'default' | 'savings' }) =>
+      apiPatch<{ id: number; name: string; category_type: string }>(`/categories/${id}`, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['categoryList'] });
+      qc.invalidateQueries({ queryKey: ['categoryOverview'] });
+      qc.invalidateQueries({ queryKey: ['categoryRules'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
+    },
+  });
+}
+
+export function useDeleteCategory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, replacement_category }: { id: number; replacement_category: string }) =>
+      apiPost<{ success: boolean; reassigned_transactions: number }>(`/categories/${id}/delete`, { replacement_category }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['categoryList'] });
+      qc.invalidateQueries({ queryKey: ['categoryOverview'] });
+      qc.invalidateQueries({ queryKey: ['categoryRules'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
+    },
+  });
+}
+
 export function useRecategorize() {
   const qc = useQueryClient();
   return useMutation({
@@ -307,5 +435,124 @@ export function useSuggestPattern() {
   return useMutation({
     mutationFn: (data: { transaction_id: number; category: string }) =>
       apiPost<PatternSuggestion>('/ai/suggest-pattern', data),
+  });
+}
+
+// ── Batch AI Categorization ─────────────────────────────────────────
+
+export interface BatchSuggestion {
+  counterparty: string;
+  transaction_ids: number[];
+  suggested_category: string;
+  is_new_category: boolean;
+  confidence: 'high' | 'medium' | 'low';
+  rule_pattern: string;
+  rule_match_type: 'keyword' | 'regex';
+  rule_match_field: 'counterparty' | 'description' | 'both';
+  explanation: string;
+  count: number;
+}
+
+export interface CounterpartyGroup {
+  counterparty: string;
+  transaction_ids: number[];
+  sample_descriptions: string[];
+  sample_amounts: number[];
+  direction: string;
+  count: number;
+}
+
+export interface BatchApplyAction {
+  counterparty: string;
+  transaction_ids: number[];
+  category: string;
+  create_rule: boolean;
+  rule?: { pattern: string; match_type: string; match_field: string };
+}
+
+export interface BatchApplyResponse {
+  success: boolean;
+  updated_transactions: number;
+  rules_created: number;
+}
+
+export interface BatchProgress {
+  status: 'idle' | 'loading' | 'done' | 'error' | 'stopped';
+  suggestions: BatchSuggestion[];
+  completed: number;
+  totalGroups: number;
+  totalTransactions: number;
+  currentGroup: string;
+  error?: string;
+}
+
+// ── Analytics ────────────────────────────────────────────────────────
+
+export interface FlowData {
+  nodes: { id: string; label: string; color: string }[];
+  links: { source: string; target: string; value: number }[];
+}
+
+export interface DailySpending {
+  day: string;
+  value: number;
+}
+
+export interface CategoryMonthly {
+  month: string;
+  categories: Record<string, number>;
+}
+
+export function useFlowAnalysis(filters: { year?: string; month?: string; account?: string }) {
+  const params = new URLSearchParams();
+  if (filters.year) params.set('year', filters.year);
+  if (filters.month) params.set('month', filters.month);
+  if (filters.account) accountParams(params, filters.account);
+  const qs = params.toString();
+
+  return useQuery<FlowData>({
+    queryKey: ['flowAnalysis', filters],
+    queryFn: () => apiFetch(`/analysis/flow${qs ? `?${qs}` : ''}`),
+  });
+}
+
+export function useDailySpending(filters: { year?: string; account?: string }) {
+  const params = new URLSearchParams();
+  if (filters.year) params.set('year', filters.year);
+  if (filters.account) accountParams(params, filters.account);
+  const qs = params.toString();
+
+  return useQuery<DailySpending[]>({
+    queryKey: ['dailySpending', filters],
+    queryFn: () => apiFetch(`/analysis/daily${qs ? `?${qs}` : ''}`),
+  });
+}
+
+export function useCategoryMonthly(filters: { year?: string; account?: string }) {
+  const params = new URLSearchParams();
+  if (filters.year) params.set('year', filters.year);
+  if (filters.account) accountParams(params, filters.account);
+  const qs = params.toString();
+
+  return useQuery<CategoryMonthly[]>({
+    queryKey: ['categoryMonthly', filters],
+    queryFn: () => apiFetch(`/analysis/category-monthly${qs ? `?${qs}` : ''}`),
+  });
+}
+
+export function useBatchApply() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { actions: BatchApplyAction[] }) =>
+      apiPost<BatchApplyResponse>('/ai/batch-apply', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
+      qc.invalidateQueries({ queryKey: ['categoryList'] });
+      qc.invalidateQueries({ queryKey: ['categoryOverview'] });
+      qc.invalidateQueries({ queryKey: ['categoryRules'] });
+      qc.invalidateQueries({ queryKey: ['summary'] });
+      qc.invalidateQueries({ queryKey: ['monthly'] });
+    },
   });
 }

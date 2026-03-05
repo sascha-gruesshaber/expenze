@@ -11,6 +11,7 @@ export interface ParsedTransaction {
   direction: 'credit' | 'debit';
   category: string;
   source_file: string;
+  counterparty_iban: string | null;
   hash: string;
   iban: string | null;
   bank_name: string;
@@ -24,21 +25,34 @@ export interface BankParser {
 }
 
 export const CATEGORY_RULES: [RegExp, string][] = [
-  [/REWE|LIDL|ALDI|NETTO|KAUFLAND|EDEKA|PENNY|NORMA|MH MULLER|MUELLER/i, 'Lebensmittel & Einkauf'],
-  [/FRESSNAPF|Tierhandlung/i, 'Haustier'],
-  [/VPV|VERSICHERUNG|ALLIANZ|HUK|ARAG|AXA|ERGO/i, 'Versicherung'],
-  [/LECHWERKE|LEW Verteilnetz|energie schwaben|GAS Abschlag/i, 'Energie & Nebenkosten'],
+  [/REWE|LIDL|ALDI|NETTO|KAUFLAND|EDEKA|PENNY|NORMA/i, 'Lebensmittel'],
+  [/MH MULLER|MUELLER|ROSSMANN|DM-DROGERIE|DM FIL/i, 'Drogerie & Körperpflege'],
+  [/FRESSNAPF|Tierhandlung|ZOOPLUS|Futterhaus/i, 'Haustier'],
+  [/VPV|VERSICHERUNG|ALLIANZ|HUK|ARAG|AXA|ERGO/i, 'Versicherungen'],
+  [/LECHWERKE|LEW Verteilnetz|energie schwaben|GAS Abschlag|Stadtwerke/i, 'Energie & Nebenkosten'],
   [/PHOTOVOLTAIK|Einspeisung/i, 'Einspeisung Photovoltaik'],
-  [/TELEKOM|VODAFONE|O2 |INTERNET/i, 'Telefon & Internet'],
-  [/APOTHEKE|ARZT|KRANKENHAUS/i, 'Gesundheit'],
-  [/Grundsteuer|Gemeinde Buttenwiesen/i, 'Steuern & Abgaben'],
+  [/TELEKOM|VODAFONE|O2 |INTERNET|1&1/i, 'Telefon & Internet'],
+  [/APOTHEKE|ARZT|KRANKENHAUS|KLINIK|ZAHNARZT|OPTIKER/i, 'Gesundheit & Apotheke'],
+  [/Grundsteuer|Gemeinde Buttenwiesen|Finanzamt|GEZ|Rundfunk/i, 'Steuern & Abgaben'],
   [/Teilzahlung Darlehen|Darlehen/i, 'Kredit & Darlehen'],
   [/Haushaltsgeld|Haushaltskonto/i, 'Haushalt'],
-  [/AMAZON|EBAY|PAYPAL|ZALANDO|OTTO/i, 'Online Shopping'],
-  [/TANKSTELLE|ARAL|SHELL|BP|ESSO/i, 'Kraftstoff'],
-  [/BAHN|FLUG|LUFTHANSA|TAXI|UBER/i, 'Reise & Verkehr'],
+  [/AMAZON|EBAY|ZALANDO|OTTO|TEMU|SHEIN/i, 'Online Shopping'],
+  [/TANKSTELLE|ARAL|SHELL|BP|ESSO|JET |TOTAL/i, 'Kraftstoff & Tanken'],
+  [/BAHN|DB Vertrieb|FLIXBUS|MVV|ÖPNV|Nahverkehr/i, 'ÖPNV & Nahverkehr'],
+  [/FLUG|LUFTHANSA|TAXI|UBER|BOOKING|AIRBNB|Hotel/i, 'Reisen & Urlaub'],
   [/Kontoführung|Abschluss/i, 'Bankgebühren'],
-  [/Aufrundkonto|Aufrundung|Sparrate|Sparen\s/i, 'Sparen'],
+  [/Aufrundkonto|Aufrundung|Sparrate|Sparen\s|Depot|ETF/i, 'Sparen & Anlage'],
+  [/LIEFERANDO|PIZZA|MCDONALDS|BURGER KING|SUBWAY|STARBUCKS|RESTAURANT|IMBISS/i, 'Restaurant & Lieferdienst'],
+  [/SPOTIFY|NETFLIX|DISNEY|APPLE\.COM|GOOGLE \*|DAZN|YOUTUBE/i, 'Abonnements & Streaming'],
+  [/PAYPAL/i, 'Online Shopping'],
+  [/Miete|Kaltmiete|Warmmiete|Mietvertrag/i, 'Wohnen & Miete'],
+  [/GEHALT|LOHN|Bezüge|Entgelt/i, 'Gehalt & Lohn'],
+  [/Geldautomat|Abhebung|ATM/i, 'Bargeldabhebung'],
+  [/Umbuchung|Übertrag|Eigenübertrag/i, 'Umbuchung & Übertrag'],
+  [/TÜV|ADAC|Werkstatt|KFZ|Reparatur Auto/i, 'Auto & Werkstatt'],
+  [/FITNESSSTUDIO|GYM|MCFIT|FITX|Sportverein/i, 'Sport & Fitness'],
+  [/KINO|THEATER|KONZERT|EVENTIM|TICKETMASTER/i, 'Freizeit & Unterhaltung'],
+  [/H&M|ZARA|C&A|PRIMARK|DEICHMANN|SCHUH/i, 'Kleidung & Schuhe'],
 ];
 
 export function categorize(text: string): string {
@@ -79,6 +93,13 @@ export function categorizeWithRules(description: string, counterparty: string, d
     }
   }
   return 'Sonstiges';
+}
+
+export function extractCounterpartyIban(text: string): string | null {
+  const m = text.match(/IBAN:\s*([A-Z]{2}\d{2}[\d\s]{8,30})/);
+  if (!m) return null;
+  const iban = m[1].replace(/\s/g, '');
+  return iban.length >= 15 && iban.length <= 34 ? iban : null;
 }
 
 export function parseAmount(amountStr: string): number {

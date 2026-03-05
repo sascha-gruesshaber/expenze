@@ -3,8 +3,9 @@ import multer from 'multer';
 import { prisma } from './prisma.js';
 import { parsePdf } from './parser.js';
 import { Prisma } from '@prisma/client';
-import { categorizeWithRules, type DbCategoryRule } from './parsers/types.js';
-import { suggestCategoryPattern } from './ai.js';
+import { categorizeWithRules, extractCounterpartyIban, type DbCategoryRule } from './parsers/types.js';
+import { suggestCategoryPattern, categorizeGroup, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
+import { DEFAULT_RULES, DEFAULT_CATEGORIES } from './defaultRules.js';
 
 const router = Router();
 
@@ -23,6 +24,16 @@ function serialize<T>(data: T): T {
   return data;
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+// Auto-create category in table if it doesn't exist
+async function ensureCategoryExists(name: string) {
+  const existing = await prisma.category.findUnique({ where: { name } });
+  if (!existing) {
+    await prisma.category.create({
+      data: { name, is_default: false, created_at: new Date().toISOString() },
+    });
+  }
+}
 
 // Find or create account from parsed transaction data
 async function findOrCreateAccount(tx: { iban: string | null; account_number: string; bank_name: string }): Promise<number> {
@@ -82,6 +93,7 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
               type: tx.type,
               description: tx.description,
               counterparty: tx.counterparty,
+              counterparty_iban: tx.counterparty_iban,
               amount: tx.amount,
               direction: tx.direction,
               category: category,
@@ -189,9 +201,11 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
 
     let sql = `
       SELECT t.category,
-        SUM(t.amount) as total,
-        COUNT(*) as count
+        CAST(SUM(t.amount) AS REAL) as total,
+        COUNT(*) as count,
+        COALESCE(c.category_type, 'default') as category_type
       FROM transactions t
+      LEFT JOIN categories c ON c.name = t.category
       WHERE t.direction = ?
     `;
     const params: any[] = [direction];
@@ -228,7 +242,6 @@ router.get('/analysis/summary', async (req: Request, res: Response) => {
     const totals: any[] = await prisma.$queryRawUnsafe(sql, ...params);
     const importLog = await prisma.importLog.findMany({
       orderBy: { imported_at: 'desc' },
-      take: 10,
     });
     res.json({ stats: serialize(totals[0]), imports: importLog });
   } catch (err: any) {
@@ -253,12 +266,8 @@ router.patch('/transactions/:id/category', async (req: Request, res: Response) =
 // Get all available categories
 router.get('/categories', async (_req: Request, res: Response) => {
   try {
-    const rows = await prisma.transaction.findMany({
-      distinct: ['category'],
-      select: { category: true },
-      orderBy: { category: 'asc' },
-    });
-    res.json(rows.map(r => r.category));
+    const rows = await prisma.category.findMany({ orderBy: { name: 'asc' } });
+    res.json(rows.map(r => r.name));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -324,6 +333,7 @@ router.get('/category-rules', async (_req: Request, res: Response) => {
 router.post('/category-rules', async (req: Request, res: Response) => {
   try {
     const { category, pattern, match_field, match_type, priority } = req.body;
+    await ensureCategoryExists(category);
     // Validate regex if match_type is regex
     if (match_type === 'regex') {
       try { new RegExp(pattern); } catch { return res.status(400).json({ error: 'Ungültiger regulärer Ausdruck' }); }
@@ -380,29 +390,170 @@ router.delete('/category-rules/:id', async (req: Request, res: Response) => {
 });
 
 // Categories overview with tx counts, totals, rule counts
-router.get('/categories/overview', async (_req: Request, res: Response) => {
+router.get('/categories/overview', async (req: Request, res: Response) => {
   try {
-    const categories: any[] = await prisma.$queryRawUnsafe(`
+    const { year, month, account_id, include_savings } = req.query as Record<string, string>;
+
+    // All categories from DB table
+    const allCats = await prisma.category.findMany({ orderBy: { name: 'asc' } });
+
+    // Transaction stats grouped by category (with optional filters)
+    let sql = `
       SELECT
         t.category,
         COUNT(*) as tx_count,
-        SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) as total_debit,
-        SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) as total_credit
+        CAST(SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) AS REAL) as total_debit,
+        CAST(SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) AS REAL) as total_credit
       FROM transactions t
-      GROUP BY t.category
-      ORDER BY tx_count DESC
-    `);
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+    sql += accountFilterSql(params, { account_id, include_savings });
+    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
+    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+    sql += ' GROUP BY t.category';
 
+    const txStatsRaw: any[] = await prisma.$queryRawUnsafe(sql, ...params);
+    const txStats = serialize(txStatsRaw);
+    const statsMap: Record<string, any> = {};
+    for (const s of txStats) {
+      statsMap[s.category] = s;
+    }
+
+    // Rule counts
     const rules = await prisma.categoryRule.findMany();
     const ruleCountMap: Record<string, number> = {};
     for (const r of rules) {
       ruleCountMap[r.category] = (ruleCountMap[r.category] || 0) + 1;
     }
 
-    res.json(serialize(categories.map(c => ({
-      ...c,
-      rule_count: ruleCountMap[c.category] || 0,
-    }))));
+    const result = allCats.map(c => ({
+      category: c.name,
+      category_id: c.id,
+      is_default: c.is_default,
+      category_type: c.category_type,
+      tx_count: Number(statsMap[c.name]?.tx_count ?? 0),
+      total_debit: Number(statsMap[c.name]?.total_debit ?? 0),
+      total_credit: Number(statsMap[c.name]?.total_credit ?? 0),
+      rule_count: ruleCountMap[c.name] || 0,
+    }));
+
+    // Sort: categories with transactions first (by tx_count DESC), then empty ones alphabetically
+    result.sort((a, b) => {
+      if (a.tx_count > 0 && b.tx_count === 0) return -1;
+      if (a.tx_count === 0 && b.tx_count > 0) return 1;
+      if (a.tx_count > 0 && b.tx_count > 0) return b.tx_count - a.tx_count;
+      return a.category.localeCompare(b.category, 'de');
+    });
+
+    res.json(serialize(result));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== Category CRUD ====================
+
+// Create a new category
+router.post('/categories', async (req: Request, res: Response) => {
+  try {
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Name darf nicht leer sein' });
+    }
+    const trimmed = name.trim();
+    const existing = await prisma.category.findUnique({ where: { name: trimmed } });
+    if (existing) {
+      return res.status(409).json({ error: 'Kategorie existiert bereits' });
+    }
+    const cat = await prisma.category.create({
+      data: { name: trimmed, is_default: false, created_at: new Date().toISOString() },
+    });
+    res.json(cat);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update a category (rename and/or change type)
+router.patch('/categories/:id', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id as string);
+    const { name, category_type } = req.body;
+    const cat = await prisma.category.findUnique({ where: { id } });
+    if (!cat) return res.status(404).json({ error: 'Kategorie nicht gefunden' });
+
+    const data: any = {};
+
+    // Handle category_type change
+    if (category_type !== undefined && ['default', 'savings'].includes(category_type)) {
+      data.category_type = category_type;
+    }
+
+    // Handle rename
+    if (name !== undefined) {
+      if (typeof name !== 'string' || name.trim().length === 0) {
+        return res.status(400).json({ error: 'Name darf nicht leer sein' });
+      }
+      if (cat.name === 'Sonstiges') return res.status(400).json({ error: '"Sonstiges" kann nicht umbenannt werden' });
+
+      const trimmed = name.trim();
+      if (trimmed !== cat.name) {
+        const duplicate = await prisma.category.findUnique({ where: { name: trimmed } });
+        if (duplicate) return res.status(409).json({ error: 'Kategorie existiert bereits' });
+        data.name = trimmed;
+      }
+    }
+
+    if (Object.keys(data).length === 0) return res.json(cat);
+
+    const updated = await prisma.category.update({ where: { id }, data });
+
+    // If renamed, cascade to transactions and rules
+    if (data.name && data.name !== cat.name) {
+      await prisma.$executeRawUnsafe(
+        'UPDATE transactions SET category = ? WHERE category = ?',
+        data.name, cat.name
+      );
+      await prisma.$executeRawUnsafe(
+        'UPDATE category_rules SET category = ? WHERE category = ?',
+        data.name, cat.name
+      );
+    }
+
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a category (reassign transactions + rules to replacement)
+router.post('/categories/:id/delete', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id as string);
+    const { replacement_category } = req.body;
+    const cat = await prisma.category.findUnique({ where: { id } });
+    if (!cat) return res.status(404).json({ error: 'Kategorie nicht gefunden' });
+    if (cat.name === 'Sonstiges') return res.status(400).json({ error: '"Sonstiges" kann nicht gelöscht werden' });
+
+    const replacement = replacement_category || 'Sonstiges';
+    // Ensure replacement exists
+    await ensureCategoryExists(replacement);
+
+    // Reassign transactions
+    const txUpdated = await prisma.$executeRawUnsafe(
+      'UPDATE transactions SET category = ? WHERE category = ?',
+      replacement, cat.name
+    );
+    // Reassign rules
+    await prisma.$executeRawUnsafe(
+      'UPDATE category_rules SET category = ? WHERE category = ?',
+      replacement, cat.name
+    );
+    // Delete category
+    await prisma.category.delete({ where: { id } });
+
+    res.json({ success: true, reassigned_transactions: txUpdated });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -456,6 +607,8 @@ router.post('/transactions/recategorize', async (req: Request, res: Response) =>
     const { transaction_id, category, mode, create_rule, rule } = req.body;
     const tx = await prisma.transaction.findUnique({ where: { id: transaction_id } });
     if (!tx) return res.status(404).json({ error: 'Transaktion nicht gefunden' });
+
+    await ensureCategoryExists(category);
 
     let updated = 0;
 
@@ -525,24 +678,483 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
 
     res.json(result);
   } catch (err: any) {
+    console.error('AI suggest-pattern error:', err.message || err);
     // Fallback: simple counterparty-based pattern
     const tx = await prisma.transaction.findUnique({ where: { id: req.body.transaction_id } });
     const escaped = (tx?.counterparty || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    let explanation = 'KI-Vorschlag fehlgeschlagen – Fallback auf einfaches Stichwort.';
+    const msg = err.message || '';
+    if (msg.includes('not configured')) {
+      explanation = 'OPENROUTER_API_KEY nicht konfiguriert. Bitte in .env setzen.';
+    } else if (msg.includes('403') || msg.includes('limit')) {
+      explanation = 'OpenRouter API-Limit erreicht. Bitte Limit unter openrouter.ai/settings/keys erhöhen.';
+    } else if (msg.includes('401')) {
+      explanation = 'OpenRouter API-Key ungültig. Bitte unter openrouter.ai/settings/keys prüfen.';
+    }
+
     res.json({
       pattern: escaped || 'Sonstiges',
       match_type: 'keyword',
       match_field: 'counterparty',
-      explanation: 'KI nicht verfügbar – einfaches Stichwort basierend auf dem Empfänger vorgeschlagen.',
+      explanation,
     });
   }
 });
 
-// ── Reset: Delete all data ──────────────────────────────────────────
+// ── Batch AI Categorization ─────────────────────────────────────────
+
+// Step 1: Return grouped "Sonstiges" transactions (no AI, instant)
+router.post('/ai/batch-groups', async (req: Request, res: Response) => {
+  try {
+    const { limit = 50, year, month, account_id, include_savings } = req.body || {};
+
+    const catRows = await prisma.category.findMany({
+      where: { NOT: { name: 'Sonstiges' } },
+      orderBy: { name: 'asc' },
+    });
+    const existingCategories = catRows.map(r => r.name);
+
+    let sql = `SELECT id, counterparty, description, amount, direction
+       FROM transactions t WHERE category = 'Sonstiges'`;
+    const params: any[] = [];
+    sql += accountFilterSql(params, { account_id, include_savings });
+    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
+    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(String(month).padStart(2, '0')); }
+    sql += ' ORDER BY t.bu_date DESC';
+
+    const sonstige: any[] = await prisma.$queryRawUnsafe(sql, ...params);
+
+    if (sonstige.length === 0) {
+      return res.json({ groups: [], existing_categories: existingCategories, total_transactions: 0 });
+    }
+
+    const groupMap = new Map<string, { ids: number[]; descriptions: string[]; amounts: number[]; directions: string[] }>();
+    for (const tx of sonstige) {
+      const key = (tx.counterparty && tx.counterparty.trim() !== '')
+        ? tx.counterparty
+        : (tx.description || '').substring(0, 30).trim() || 'unbekannt';
+      const group = groupMap.get(key) || { ids: [], descriptions: [], amounts: [], directions: [] };
+      group.ids.push(Number(tx.id));
+      if (group.descriptions.length < 5) group.descriptions.push(tx.description || '');
+      if (group.amounts.length < 5) group.amounts.push(Number(tx.amount) || 0);
+      group.directions.push(tx.direction || 'debit');
+      groupMap.set(key, group);
+    }
+
+    const sortedEntries = [...groupMap.entries()].sort((a, b) => b[1].ids.length - a[1].ids.length);
+    const cappedEntries = sortedEntries.slice(0, limit);
+
+    const groups: CounterpartyGroup[] = cappedEntries.map(([key, g]) => {
+      const debitCount = g.directions.filter(d => d === 'debit').length;
+      const direction = debitCount >= g.directions.length / 2 ? 'debit' : 'credit';
+      return {
+        counterparty: key,
+        transaction_ids: g.ids,
+        sample_descriptions: g.descriptions,
+        sample_amounts: g.amounts,
+        direction,
+        count: g.ids.length,
+      };
+    });
+
+    res.json({ groups, existing_categories: existingCategories, total_transactions: sonstige.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Step 2: Categorize a single group (one AI call)
+router.post('/ai/batch-categorize', async (req: Request, res: Response) => {
+  try {
+    const { group, existing_categories } = req.body as {
+      group: CounterpartyGroup;
+      existing_categories: string[];
+    };
+    const suggestion = await categorizeGroup(group, existing_categories);
+    res.json(suggestion);
+  } catch (err: any) {
+    console.error('Batch categorize error:', err.message || err);
+    const status = err.message?.includes('nicht konfiguriert') ? 400 : 500;
+    res.status(status).json({ error: err.message });
+  }
+});
+
+// Batch apply categorization changes
+router.post('/ai/batch-apply', async (req: Request, res: Response) => {
+  try {
+    const { actions } = req.body as {
+      actions: Array<{
+        counterparty: string;
+        transaction_ids: number[];
+        category: string;
+        create_rule: boolean;
+        rule?: { pattern: string; match_type: string; match_field: string };
+      }>;
+    };
+
+    let updatedTransactions = 0;
+    let rulesCreated = 0;
+
+    for (const action of actions) {
+      await ensureCategoryExists(action.category);
+      // Update transactions
+      if (action.transaction_ids.length > 0) {
+        const placeholders = action.transaction_ids.map(() => '?').join(',');
+        const result = await prisma.$executeRawUnsafe(
+          `UPDATE transactions SET category = ? WHERE id IN (${placeholders})`,
+          action.category,
+          ...action.transaction_ids,
+        );
+        updatedTransactions += result;
+      }
+
+      // Create rule if requested
+      if (action.create_rule && action.rule) {
+        // Check for duplicate
+        const existing = await prisma.categoryRule.findFirst({
+          where: {
+            pattern: action.rule.pattern,
+            match_field: action.rule.match_field,
+            category: action.category,
+          },
+        });
+        if (!existing) {
+          if (action.rule.match_type === 'regex') {
+            try { new RegExp(action.rule.pattern); } catch { continue; }
+          }
+          await prisma.categoryRule.create({
+            data: {
+              category: action.category,
+              pattern: action.rule.pattern,
+              match_field: action.rule.match_field || 'counterparty',
+              match_type: action.rule.match_type || 'keyword',
+              priority: 100,
+              is_default: false,
+              created_at: new Date().toISOString(),
+            },
+          });
+          rulesCreated++;
+        }
+      }
+    }
+
+    res.json({ success: true, updated_transactions: updatedTransactions, rules_created: rulesCreated });
+  } catch (err: any) {
+    console.error('Batch apply error:', err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI Model Settings ───────────────────────────────────────────────
+
+router.get('/settings/ai-model', async (_req: Request, res: Response) => {
+  try {
+    const [setting, customModels, zdrIds, availableIds] = await Promise.all([
+      prisma.setting.findUnique({ where: { key: 'ai_model' } }),
+      prisma.setting.findUnique({ where: { key: 'custom_models' } }),
+      fetchZdrModelIds().catch(() => new Set<string>()),
+      fetchAvailableModelIds(),
+    ]);
+    const custom: string[] = customModels?.value ? JSON.parse(customModels.value) : [];
+    res.json({
+      current: setting?.value || 'google/gemini-3.1-flash-lite-preview',
+      presets: PRESET_MODELS,
+      freeModel: FREE_MODEL,
+      custom,
+      hasApiKey: hasApiKey(),
+      zdrModelIds: [...zdrIds],
+      availableModelIds: [...availableIds],
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch('/settings/ai-model', async (req: Request, res: Response) => {
+  try {
+    const { model } = req.body;
+    if (!model || typeof model !== 'string') {
+      return res.status(400).json({ error: 'Model ID erforderlich' });
+    }
+    await prisma.setting.upsert({
+      where: { key: 'ai_model' },
+      update: { value: model.trim() },
+      create: { key: 'ai_model', value: model.trim() },
+    });
+    res.json({ success: true, model: model.trim() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/settings/ai-model/browse', async (_req: Request, res: Response) => {
+  try {
+    const result = await fetchAllModels();
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/settings/ai-model/custom', async (req: Request, res: Response) => {
+  try {
+    const { model } = req.body;
+    if (!model || typeof model !== 'string' || !model.includes('/')) {
+      return res.status(400).json({ error: 'Model ID im Format "provider/model-name" erforderlich' });
+    }
+    const existing = await prisma.setting.findUnique({ where: { key: 'custom_models' } });
+    const custom: string[] = existing?.value ? JSON.parse(existing.value) : [];
+    const trimmed = model.trim();
+    if (!custom.includes(trimmed)) {
+      custom.push(trimmed);
+      await prisma.setting.upsert({
+        where: { key: 'custom_models' },
+        update: { value: JSON.stringify(custom) },
+        create: { key: 'custom_models', value: JSON.stringify(custom) },
+      });
+    }
+    res.json({ success: true, custom });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/settings/ai-model/custom', async (req: Request, res: Response) => {
+  try {
+    const { model } = req.body;
+    const existing = await prisma.setting.findUnique({ where: { key: 'custom_models' } });
+    const custom: string[] = existing?.value ? JSON.parse(existing.value) : [];
+    const filtered = custom.filter(m => m !== model);
+    await prisma.setting.upsert({
+      where: { key: 'custom_models' },
+      update: { value: JSON.stringify(filtered) },
+      create: { key: 'custom_models', value: JSON.stringify(filtered) },
+    });
+    res.json({ success: true, custom: filtered });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Analysis: Flow (Sankey) ─────────────────────────────────────────
+router.get('/analysis/flow', async (req: Request, res: Response) => {
+  try {
+    const { year, month, account_id, include_savings } = req.query as Record<string, string>;
+
+    let baseSql = ' WHERE 1=1';
+    const params: any[] = [];
+    baseSql += accountFilterSql(params, { account_id, include_savings });
+    if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
+    if (month) { baseSql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+
+    // Income: group by counterparty_iban where available, fall back to counterparty text
+    const incomeByIban: any[] = await prisma.$queryRawUnsafe(
+      `SELECT t.counterparty_iban as group_key, MIN(t.counterparty) as label, CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NOT NULL
+       GROUP BY t.counterparty_iban ORDER BY total DESC LIMIT 10`,
+      ...params,
+    );
+    const incomeByText: any[] = await prisma.$queryRawUnsafe(
+      `SELECT t.counterparty as group_key, t.counterparty as label, CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NULL
+       GROUP BY t.counterparty ORDER BY total DESC LIMIT 10`,
+      ...params,
+    );
+    // Merge, deduplicate, top 10
+    const incomeRows = [...incomeByIban, ...incomeByText]
+      .sort((a, b) => (Number(b.total) || 0) - (Number(a.total) || 0))
+      .slice(0, 10)
+      .map(r => ({ counterparty: r.label || 'Unbekannt', total: r.total }));
+
+    // Remaining income → "Sonstige Einnahmen"
+    const incomeTotal: any[] = await prisma.$queryRawUnsafe(
+      `SELECT CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql} AND t.direction = 'credit'`,
+      ...params,
+    );
+    const topIncomeTotal = incomeRows.reduce((s: number, r: any) => s + (Number(r.total) || 0), 0);
+    const allIncomeTotal = Number(incomeTotal[0]?.total) || 0;
+    const otherIncome = allIncomeTotal - topIncomeTotal;
+
+    // Expenses by category
+    const expenseRows: any[] = await prisma.$queryRawUnsafe(
+      `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql} AND t.direction = 'debit'
+       GROUP BY t.category ORDER BY total DESC`,
+      ...params,
+    );
+
+    // Build Sankey nodes & links
+    const incomeColors = ['#0D9373', '#10B981', '#34D399', '#6EE7B7', '#A7F3D0', '#22C55E', '#16A34A', '#15803D', '#4ADE80', '#86EFAC'];
+    const expenseColors = ['#DC5944', '#D4930D', '#7C5CDB', '#E07B53', '#3BA0A8', '#A85C9E', '#6B9E42', '#C7633D', '#4A7AE5', '#9CA3AF'];
+
+    const nodes: { id: string; label: string; color: string }[] = [];
+    const links: { source: string; target: string; value: number }[] = [];
+
+    // Income source nodes
+    for (let i = 0; i < incomeRows.length; i++) {
+      const r = incomeRows[i];
+      const name = r.counterparty || 'Unbekannt';
+      const id = `in_${i}`;
+      nodes.push({ id, label: name, color: incomeColors[i % incomeColors.length] });
+      links.push({ source: id, target: 'konto', value: Number(r.total) || 0 });
+    }
+    if (otherIncome > 0) {
+      nodes.push({ id: 'in_other', label: 'Sonstige Einnahmen', color: '#A8A29E' });
+      links.push({ source: 'in_other', target: 'konto', value: otherIncome });
+    }
+
+    // Account node
+    nodes.push({ id: 'konto', label: 'Konto', color: '#4A7AE5' });
+
+    // Expense category nodes
+    for (let i = 0; i < expenseRows.length; i++) {
+      const r = expenseRows[i];
+      const id = `out_${i}`;
+      nodes.push({ id, label: r.category || 'Sonstiges', color: expenseColors[i % expenseColors.length] });
+      links.push({ source: 'konto', target: id, value: Number(r.total) || 0 });
+    }
+
+    // Filter out zero-value links and orphan nodes
+    const validLinks = links.filter(l => l.value > 0);
+    const usedNodeIds = new Set(validLinks.flatMap(l => [l.source, l.target]));
+    const validNodes = nodes.filter(n => usedNodeIds.has(n.id));
+
+    res.json(serialize({ nodes: validNodes, links: validLinks }));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Analysis: Daily spending (Calendar heatmap) ─────────────────────
+router.get('/analysis/daily', async (req: Request, res: Response) => {
+  try {
+    const { year, account_id, include_savings } = req.query as Record<string, string>;
+    const targetYear = year || String(new Date().getFullYear());
+
+    let sql = `
+      SELECT t.bu_date as day, CAST(SUM(t.amount) AS REAL) as value
+      FROM transactions t
+      WHERE t.direction = 'debit' AND strftime('%Y', t.bu_date) = ?
+    `;
+    const params: any[] = [targetYear];
+    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += ' GROUP BY t.bu_date ORDER BY t.bu_date ASC';
+
+    const rows = await prisma.$queryRawUnsafe(sql, ...params);
+    res.json(serialize(rows));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Analysis: Category monthly (Stacked area) ──────────────────────
+router.get('/analysis/category-monthly', async (req: Request, res: Response) => {
+  try {
+    const { year, account_id, include_savings } = req.query as Record<string, string>;
+
+    let baseSql = ' WHERE t.direction = \'debit\'';
+    const params: any[] = [];
+    baseSql += accountFilterSql(params, { account_id, include_savings });
+    if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
+
+    // Pass 1: top 8 categories by total
+    const topCats: any[] = await prisma.$queryRawUnsafe(
+      `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql}
+       GROUP BY t.category ORDER BY total DESC LIMIT 8`,
+      ...params,
+    );
+    const topCatNames = new Set(topCats.map((r: any) => r.category));
+
+    // Pass 2: monthly breakdown
+    const monthlyRows: any[] = await prisma.$queryRawUnsafe(
+      `SELECT strftime('%Y-%m', t.bu_date) as month, t.category, CAST(SUM(t.amount) AS REAL) as total
+       FROM transactions t ${baseSql}
+       GROUP BY month, t.category ORDER BY month ASC`,
+      ...params,
+    );
+
+    // Aggregate
+    const monthMap = new Map<string, Record<string, number>>();
+    for (const row of monthlyRows) {
+      if (!row.month) continue;
+      if (!monthMap.has(row.month)) monthMap.set(row.month, {});
+      const cats = monthMap.get(row.month)!;
+      const cat = topCatNames.has(row.category) ? row.category : 'Sonstige';
+      cats[cat] = (cats[cat] || 0) + (Number(row.total) || 0);
+    }
+
+    const result = Array.from(monthMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, categories]) => ({ month, categories }));
+
+    res.json(serialize(result));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Backfill: Extract counterparty_iban from existing transaction descriptions ──
+router.post('/backfill/counterparty-iban', async (_req: Request, res: Response) => {
+  try {
+    const transactions: any[] = await prisma.$queryRawUnsafe(
+      `SELECT id, description FROM transactions WHERE description IS NOT NULL`
+    );
+    let updated = 0;
+    for (const tx of transactions) {
+      const iban = extractCounterpartyIban(tx.description);
+      if (iban) {
+        await prisma.$executeRawUnsafe(
+          `UPDATE transactions SET counterparty_iban = ? WHERE id = ?`,
+          iban, tx.id
+        );
+        updated++;
+      } else {
+        await prisma.$executeRawUnsafe(
+          `UPDATE transactions SET counterparty_iban = NULL WHERE id = ?`,
+          tx.id
+        );
+      }
+    }
+    res.json({ success: true, scanned: transactions.length, updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Reset: Delete all data and re-seed default category rules + categories ───
 router.delete('/reset', async (_req: Request, res: Response) => {
   await prisma.transaction.deleteMany();
   await prisma.importLog.deleteMany();
   await prisma.account.deleteMany();
   await prisma.categoryRule.deleteMany();
+  await prisma.category.deleteMany();
+
+  // Re-seed default categories
+  for (const cat of DEFAULT_CATEGORIES) {
+    await prisma.category.create({
+      data: { name: cat.name, is_default: true, category_type: cat.type, created_at: new Date().toISOString() },
+    });
+  }
+
+  // Re-seed default category rules
+  for (let i = 0; i < DEFAULT_RULES.length; i++) {
+    const rule = DEFAULT_RULES[i];
+    await prisma.categoryRule.create({
+      data: {
+        category: rule.category,
+        pattern: rule.pattern,
+        match_field: 'description',
+        match_type: 'regex',
+        priority: (i + 1) * 10,
+        is_default: true,
+        created_at: new Date().toISOString(),
+      },
+    });
+  }
+
   res.json({ ok: true });
 });
 

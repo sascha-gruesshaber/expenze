@@ -7,12 +7,17 @@ ChartJS.register(ArcElement, Tooltip);
 interface SavingsRingProps {
   income: number;
   expenses: number;
+  savingsTotal: number;
 }
 
-export function SavingsRing({ income, expenses }: SavingsRingProps) {
-  const savings = income - expenses;
+export function SavingsRing({ income, expenses, savingsTotal }: SavingsRingProps) {
+  // If there are savings-type categories with data, use that as the savings amount.
+  // Otherwise fall back to income - expenses (leftover).
+  const hasSavingsCategories = savingsTotal > 0;
+  const savings = hasSavingsCategories ? savingsTotal : Math.max(income - expenses, 0);
   const rate = income > 0 ? (savings / income) * 100 : 0;
-  const isPositive = savings >= 0;
+  const remainder = income - expenses;
+  const isPositive = remainder >= 0;
 
   return (
     <div className="flex flex-col items-center justify-center h-full gap-5">
@@ -23,7 +28,7 @@ export function SavingsRing({ income, expenses }: SavingsRingProps) {
             datasets: [
               {
                 data: isPositive
-                  ? [Math.max(savings, 0), expenses]
+                  ? [Math.max(savings, 0), Math.max(expenses - savingsTotal, 0)]
                   : [0, expenses],
                 backgroundColor: isPositive
                   ? ['#0D9373', '#F0EFEB']
@@ -70,7 +75,9 @@ export function SavingsRing({ income, expenses }: SavingsRingProps) {
           {fmt(savings)}
         </div>
         <div className="text-[11px] text-text-3 mt-1">
-          {isPositive ? 'gespart in diesem Zeitraum' : 'mehr ausgegeben als eingenommen'}
+          {hasSavingsCategories
+            ? 'in Spar-Kategorien geflossen'
+            : isPositive ? 'gespart in diesem Zeitraum' : 'mehr ausgegeben als eingenommen'}
         </div>
       </div>
     </div>

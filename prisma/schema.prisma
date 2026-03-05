@@ -32,6 +32,7 @@ model Transaction {
   direction      String?
   category       String?
   source_file    String?
+  counterparty_iban String?
   hash           String?  @unique(map: "sqlite_autoindex_transactions_1")
   account_id     Int?
   account        Account? @relation(fields: [account_id], references: [id])
@@ -50,6 +51,23 @@ model CategoryRule {
   created_at  String?
 
   @@map("category_rules")
+}
+
+model Category {
+  id            Int     @id @default(autoincrement())
+  name          String  @unique
+  is_default    Boolean @default(false)
+  category_type String  @default("default")
+  created_at    String?
+
+  @@map("categories")
+}
+
+model Setting {
+  key   String @id
+  value String
+
+  @@map("settings")
 }
 
 model ImportLog {

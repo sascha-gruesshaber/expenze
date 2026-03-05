@@ -16,12 +16,17 @@
   "dependencies": {
     "@prisma/client": "^6.5.0",
     "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "lucide-react": "^0.577.0",
     "multer": "^2.1.1",
     "pdfjs-dist": "^5.5.207"
   },
   "devDependencies": {
+    "@nivo/calendar": "^0.99.0",
+    "@nivo/core": "^0.99.0",
+    "@nivo/sankey": "^0.99.0",
+    "@nivo/treemap": "^0.99.0",
     "@tanstack/react-query": "^5.67.0",
     "@tanstack/react-router": "^1.114.0",
     "@tanstack/react-router-devtools": "^1.114.0",

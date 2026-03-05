@@ -140,17 +140,30 @@ export function RecategorizeDialog({ transaction, open, onClose }: RecategorizeD
               <label className="block text-[11px] font-semibold text-text-3 uppercase tracking-wider mb-2">
                 Neue Kategorie
               </label>
-              <input
-                value={newCategory}
-                onChange={(e) => setNewCategory(e.target.value)}
-                list="recat-categories"
+              <select
+                value={categories.includes(newCategory) ? newCategory : '__custom__'}
+                onChange={(e) => {
+                  if (e.target.value === '__custom__') {
+                    setNewCategory('');
+                  } else {
+                    setNewCategory(e.target.value);
+                  }
+                }}
                 className="w-full px-3 py-2.5 bg-surface-2 border border-border rounded-lg text-[13px] text-text outline-none focus:border-accent"
-                placeholder="Kategorie eingeben..."
                 autoFocus
-              />
-              <datalist id="recat-categories">
-                {categories.map((c) => <option key={c} value={c} />)}
-              </datalist>
+              >
+                <option value="" disabled>Kategorie wählen...</option>
+                {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                <option value="__custom__">+ Neue Kategorie...</option>
+              </select>
+              {(!categories.includes(newCategory) || newCategory === '') && (
+                <input
+                  value={newCategory}
+                  onChange={(e) => setNewCategory(e.target.value)}
+                  className="w-full mt-2 px-3 py-2.5 bg-surface-2 border border-border rounded-lg text-[13px] text-text outline-none focus:border-accent"
+                  placeholder="Neue Kategorie eingeben..."
+                />
+              )}
               <div className="mt-4 p-3 bg-surface-2/50 rounded-lg text-[12px] text-text-3">
                 <div className="font-medium text-text-2 mb-1">{transaction.counterparty || '—'}</div>
                 <div>{transaction.description}</div>
@@ -257,14 +270,6 @@ export function RecategorizeDialog({ transaction, open, onClose }: RecategorizeD
                 </div>
               ) : suggestion ? (
                 <div className="space-y-3">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-text-3 uppercase tracking-wider mb-1.5">Muster</label>
-                    <input
-                      value={rulePattern}
-                      onChange={(e) => setRulePattern(e.target.value)}
-                      className="w-full px-3 py-2 bg-surface-2 border border-border rounded-lg text-[13px] text-text font-mono outline-none focus:border-accent"
-                    />
-                  </div>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-[11px] font-semibold text-text-3 uppercase tracking-wider mb-1.5">Typ</label>
@@ -289,6 +294,19 @@ export function RecategorizeDialog({ transaction, open, onClose }: RecategorizeD
                         <option value="both">Beides</option>
                       </select>
                     </div>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-text-3 uppercase tracking-wider mb-1.5">Muster</label>
+                    <input
+                      value={rulePattern}
+                      onChange={(e) => setRulePattern(e.target.value)}
+                      className="w-full px-3 py-2 bg-surface-2 border border-border rounded-lg text-[13px] text-text font-mono outline-none focus:border-accent"
+                    />
+                    <p className="text-[11px] text-text-3 mt-1">
+                      {ruleMatchType === 'regex'
+                        ? 'Regulärer Ausdruck — mehrere Begriffe mit | trennen'
+                        : 'Einfaches Stichwort — Groß-/Kleinschreibung wird ignoriert'}
+                    </p>
                   </div>
                   {suggestion.explanation && (
                     <p className="text-[11px] text-text-3 italic">{suggestion.explanation}</p>

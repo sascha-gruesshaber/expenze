@@ -45,6 +45,11 @@ function DashboardPage() {
   const count = filtered.reduce((s, r) => s + (Number(r.count) || 0), 0);
   const balance = income - expenses;
 
+  // Calculate actual savings: debits going to savings-type categories
+  const savingsTotal = categories
+    .filter(c => c.category_type === 'savings')
+    .reduce((s, c) => s + (Number(c.total) || 0), 0);
+
   let prevIncome = 0;
   let prevExpenses = 0;
   let prevCount = 0;
@@ -126,7 +131,7 @@ function DashboardPage() {
           <div className="font-heading font-semibold text-[15px] text-text mb-4">
             Sparquote
           </div>
-          <SavingsRing income={income} expenses={expenses} />
+          <SavingsRing income={income} expenses={expenses} savingsTotal={savingsTotal} />
         </div>
       </div>
 
