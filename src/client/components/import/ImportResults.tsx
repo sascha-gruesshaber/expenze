@@ -25,7 +25,9 @@ export function ImportResults({ results }: ImportResultsProps) {
               )}
             </div>
             <div className="text-[12px] text-text-3 mt-0.5">
-              {res.imported} importiert · {res.skipped} übersprungen · {res.total} gesamt
+              {res.imported} importiert
+              {res.duplicates > 0 && ` · ${res.duplicates} Duplikate übersprungen`}
+              {' '}· {res.total} gesamt
             </div>
           </div>
           <div className="flex items-center gap-1.5 text-accent text-[12px] font-medium">

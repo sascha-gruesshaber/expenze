@@ -27,7 +27,7 @@ export function DropZone({ onFiles, compact }: DropZoneProps) {
     <input
       ref={inputRef}
       type="file"
-      accept=".pdf"
+      accept=".csv,.mta,.sta,.xml"
       multiple
       className="hidden"
       onChange={(e) => e.target.files?.length && onFiles(e.target.files)}
@@ -68,7 +68,7 @@ export function DropZone({ onFiles, compact }: DropZoneProps) {
         Kontoauszüge importieren
       </div>
       <div className="text-text-3 text-[13px]">
-        PDF-Kontoauszüge hier ablegen oder klicken
+        CSV, MT940 oder CAMT.052 Dateien hier ablegen oder klicken
       </div>
     </div>
   );

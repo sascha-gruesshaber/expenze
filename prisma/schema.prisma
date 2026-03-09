@@ -7,36 +7,120 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ── Better Auth Models ──────────────────────────────────────────────
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  sessions      Session[]
+  accounts      Account[]
+  bankAccounts  BankAccount[]
+  categories    Category[]
+  categoryRules CategoryRule[]
+  bankTemplates BankTemplate[]
+  settings      Setting[]
+  importLogs    ImportLog[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("session")
+}
+
 model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@map("account")
+}
+
+model Verification {
+  id         String    @id
+  identifier String    @unique
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime?
+  updatedAt  DateTime?
+
+  @@map("verification")
+}
+
+// ── App Models ──────────────────────────────────────────────────────
+
+model BankAccount {
   id             Int           @id @default(autoincrement())
   name           String
-  iban           String?       @unique
-  account_number String?       @unique
+  iban           String?
+  account_number String?
   bank           String
   account_type   String        @default("checking")
+  is_active      Boolean       @default(true)
   created_at     String?
+  userId         String?
+  user           User?         @relation(fields: [userId], references: [id])
   transactions   Transaction[]
 
-  @@map("accounts")
+  @@index([iban])
+  @@index([account_number])
+  @@index([userId])
+  @@map("bank_accounts")
 }
 
 model Transaction {
-  id             Int      @id @default(autoincrement())
-  account_number String?
-  bu_date        String?
-  value_date     String?
-  type           String?
-  description    String?
-  counterparty   String?
-  amount         Float?
-  direction      String?
-  category       String?
-  source_file    String?
-  counterparty_iban String?
-  hash           String?  @unique(map: "sqlite_autoindex_transactions_1")
-  account_id     Int?
-  account        Account? @relation(fields: [account_id], references: [id])
+  id                  Int          @id @default(autoincrement())
+  account_number      String?
+  bu_date             String?
+  value_date          String?
+  type                String?
+  description         String?
+  counterparty        String?
+  amount              Float?
+  direction           String?
+  category            String?
+  source_file         String?
+  counterparty_iban   String?
+  counterparty_bic    String?
+  purpose             String?
+  currency            String?
+  balance_after       Float?
+  creditor_id         String?
+  mandate_reference   String?
+  original_category   String?
+  hash                String?      @unique(map: "sqlite_autoindex_transactions_1")
+  dedup_key           String?
+  account_id          Int?
+  account             BankAccount? @relation(fields: [account_id], references: [id])
 
+  @@index([dedup_key], map: "idx_transactions_dedup_key")
   @@map("transactions")
 }
 
@@ -49,24 +133,50 @@ model CategoryRule {
   priority    Int     @default(100)
   is_default  Boolean @default(false)
   created_at  String?
+  userId      String?
+  user        User?   @relation(fields: [userId], references: [id])
 
+  @@index([userId])
   @@map("category_rules")
 }
 
 model Category {
   id            Int     @id @default(autoincrement())
-  name          String  @unique
+  name          String
   is_default    Boolean @default(false)
   category_type String  @default("default")
   created_at    String?
+  userId        String?
+  user          User?   @relation(fields: [userId], references: [id])
 
+  @@unique([name, userId])
   @@map("categories")
 }
 
-model Setting {
-  key   String @id
-  value String
+model BankTemplate {
+  id         String  @id
+  name       String
+  version    Int     @default(1)
+  config     String
+  is_builtin Boolean @default(false)
+  enabled    Boolean @default(true)
+  created_at String?
+  updated_at String?
+  userId     String?
+  user       User?   @relation(fields: [userId], references: [id])
 
+  @@index([userId])
+  @@map("bank_templates")
+}
+
+model Setting {
+  id     Int     @id @default(autoincrement())
+  key    String
+  value  String
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  @@unique([key, userId])
   @@map("settings")
 }
 
@@ -76,6 +186,9 @@ model ImportLog {
   imported_at      String?
   records_imported Int?
   records_skipped  Int?
+  userId           String?
+  user             User?   @relation(fields: [userId], references: [id])
 
+  @@index([userId])
   @@map("import_log")
 }

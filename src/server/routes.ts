@@ -1,13 +1,23 @@
 import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import { prisma } from './prisma.js';
-import { parsePdf } from './parser.js';
+import { parseFile, detectTemplates } from './parser.js';
 import { Prisma } from '@prisma/client';
-import { categorizeWithRules, extractCounterpartyIban, type DbCategoryRule } from './parsers/types.js';
-import { suggestCategoryPattern, categorizeGroup, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
+import { categorizeWithRules, computeHash, extractCounterpartyIban, type DbCategoryRule, type BankTemplateConfig } from './parsers/types.js';
+import { ensureBuiltinTemplates, invalidateTemplateCache } from './parsers/registry.js';
+import { parseWithTemplate } from './parsers/template-parser.js';
+import { suggestCategoryPattern, categorizeGroup, generateTemplateConfig, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
 import { DEFAULT_RULES, DEFAULT_CATEGORIES } from './defaultRules.js';
+import { requireAuth } from './authMiddleware.js';
 
 const router = Router();
+
+// All API routes require authentication
+router.use(requireAuth);
+
+function getUserId(req: Request): string {
+  return (req as any).userId;
+}
 
 // Convert BigInt values from Prisma $queryRaw to plain numbers
 function serialize<T>(data: T): T {
@@ -25,64 +35,194 @@ function serialize<T>(data: T): T {
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-// Auto-create category in table if it doesn't exist
-async function ensureCategoryExists(name: string) {
-  const existing = await prisma.category.findUnique({ where: { name } });
+// ── Cross-format deduplication ─────────────────────────────────────
+function computeDedupKey(tx: {
+  iban: string | null;
+  account_number: string;
+  bu_date: string | null;
+  amount: number;
+  direction: string;
+}): string {
+  const rawAccount = (tx.iban || tx.account_number || '').replace(/\s/g, '');
+  const normalizedAccount = rawAccount.slice(-10).replace(/^0+/, '');
+  const amountCents = Math.round(tx.amount * 100);
+  return computeHash([normalizedAccount, tx.bu_date || '', String(amountCents), tx.direction]);
+}
+
+// Backfill dedup_key for transactions imported before the column existed.
+async function backfillDedupKeys(): Promise<void> {
+  const rows = await prisma.transaction.findMany({
+    where: { dedup_key: null },
+    select: { id: true, account_number: true, bu_date: true, amount: true, direction: true },
+  });
+  if (rows.length === 0) return;
+  console.log(`  Backfilling dedup_key for ${rows.length} transactions…`);
+  for (const row of rows) {
+    const key = computeDedupKey({
+      iban: null,
+      account_number: row.account_number || '',
+      bu_date: row.bu_date || null,
+      amount: row.amount || 0,
+      direction: row.direction || '',
+    });
+    await prisma.transaction.update({ where: { id: row.id }, data: { dedup_key: key } });
+  }
+  console.log(`  Backfill complete.`);
+}
+backfillDedupKeys().catch(e => console.error('Dedup backfill error:', e));
+
+// Auto-create category in table if it doesn't exist (user-scoped)
+async function ensureCategoryExists(name: string, userId: string) {
+  const existing = await prisma.category.findFirst({ where: { name, userId } });
   if (!existing) {
     await prisma.category.create({
-      data: { name, is_default: false, created_at: new Date().toISOString() },
+      data: { name, is_default: false, userId, created_at: new Date().toISOString() },
     });
   }
 }
 
-// Find or create account from parsed transaction data
-async function findOrCreateAccount(tx: { iban: string | null; account_number: string; bank_name: string }): Promise<number> {
-  // Try to find by IBAN first, then by account_number
-  if (tx.iban) {
-    const existing = await prisma.account.findUnique({ where: { iban: tx.iban } });
-    if (existing) return existing.id;
+// Helper: upsert a setting for a user
+async function upsertSetting(key: string, value: string, userId: string) {
+  const existing = await prisma.setting.findFirst({ where: { key, userId } });
+  if (existing) {
+    return prisma.setting.update({ where: { id: existing.id }, data: { value } });
   }
-  if (tx.account_number && tx.account_number !== '' && tx.account_number !== 'unknown') {
-    const existing = await prisma.account.findUnique({ where: { account_number: tx.account_number } });
-    if (existing) return existing.id;
+  return prisma.setting.create({ data: { key, value, userId } });
+}
+
+// Find or create bank account from parsed transaction data (user-scoped)
+async function findOrCreateAccount(tx: { iban: string | null; account_number: string; bank_name: string }, userId: string): Promise<number> {
+  const hasIban = !!tx.iban;
+  const hasAccNum = tx.account_number !== '' && tx.account_number !== 'unknown';
+
+  // 1. Exact match by IBAN
+  if (hasIban) {
+    const existing = await prisma.bankAccount.findFirst({ where: { iban: tx.iban!, userId } });
+    if (existing) {
+      if (!existing.account_number && hasAccNum) {
+        await prisma.bankAccount.update({ where: { id: existing.id }, data: { account_number: tx.account_number } });
+      }
+      return existing.id;
+    }
   }
 
-  // Auto-create
+  // 2. Exact match by account_number
+  if (hasAccNum) {
+    const existing = await prisma.bankAccount.findFirst({ where: { account_number: tx.account_number, userId } });
+    if (existing) {
+      if (!existing.iban && hasIban) {
+        await prisma.bankAccount.update({ where: { id: existing.id }, data: { iban: tx.iban } });
+      }
+      return existing.id;
+    }
+  }
+
+  // 3. Cross-match: account_number embedded in an existing account's IBAN
+  if (hasAccNum) {
+    const withIban = await prisma.bankAccount.findMany({ where: { iban: { not: null }, userId } });
+    const match = withIban.find(a => a.iban!.includes(tx.account_number));
+    if (match) {
+      if (!match.account_number) {
+        await prisma.bankAccount.update({ where: { id: match.id }, data: { account_number: tx.account_number } });
+      }
+      return match.id;
+    }
+  }
+
+  // 4. Cross-match: existing account_number embedded in the incoming IBAN
+  if (hasIban) {
+    const withAccNum = await prisma.bankAccount.findMany({ where: { account_number: { not: null }, userId } });
+    const match = withAccNum.find(a => tx.iban!.includes(a.account_number!));
+    if (match) {
+      if (!match.iban) {
+        await prisma.bankAccount.update({ where: { id: match.id }, data: { iban: tx.iban } });
+      }
+      return match.id;
+    }
+  }
+
+  // 5. Auto-create
   const name = tx.bank_name === 'C24' ? 'C24 Smartkonto' : `${tx.bank_name} Girokonto`;
-  const account = await prisma.account.create({
+  const account = await prisma.bankAccount.create({
     data: {
       name,
       iban: tx.iban || null,
-      account_number: (tx.account_number && tx.account_number !== '' && tx.account_number !== 'unknown') ? tx.account_number : null,
+      account_number: hasAccNum ? tx.account_number : null,
       bank: tx.bank_name,
       account_type: 'checking',
       created_at: new Date().toISOString(),
+      userId,
     },
   });
   return account.id;
 }
 
-// Import PDF
+// Import CSV
 router.post('/import', upload.array('files'), async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const files = req.files as Express.Multer.File[];
+    const templateId = req.body?.templateId as string | undefined;
     const results = [];
 
-    // Fetch DB rules once for all files
-    const dbRules = await prisma.categoryRule.findMany() as unknown as DbCategoryRule[];
+    // Fetch DB rules for this user
+    const dbRules = await prisma.categoryRule.findMany({ where: { userId } }) as unknown as DbCategoryRule[];
 
     for (const file of files) {
-      const { transactions, detectedBank } = await parsePdf(file.buffer, file.originalname);
-      let imported = 0, skipped = 0;
-
-      // Find or create account from first transaction
-      let accountId: number | null = null;
-      if (transactions.length > 0) {
-        accountId = await findOrCreateAccount(transactions[0]);
+      // If no explicit templateId, check for conflicts
+      if (!templateId) {
+        const matchingTemplates = await detectTemplates(file.buffer, file.originalname);
+        if (matchingTemplates.length > 1) {
+          results.push({ filename: file.originalname, conflict: true, matchingTemplates });
+          continue;
+        }
       }
 
-      for (const tx of transactions) {
-        // Re-categorize using DB rules (overrides hardcoded parser rules)
+      const { transactions, detectedBank } = await parseFile(file.buffer, file.originalname, templateId);
+      let imported = 0, skipped = 0, duplicates = 0;
+
+      // Pre-compute dedup keys and batch-check for existing duplicates (user-scoped)
+      const dedupKeys = transactions.map(tx => computeDedupKey(tx));
+      const uniqueDedupKeys = [...new Set(dedupKeys.filter(Boolean))];
+      const existingDedupKeys = new Set<string>();
+      for (let i = 0; i < uniqueDedupKeys.length; i += 500) {
+        const batch = uniqueDedupKeys.slice(i, i + 500);
+        const rows = await prisma.transaction.findMany({
+          where: {
+            dedup_key: { in: batch },
+            account: { userId },
+          },
+          select: { dedup_key: true },
+        });
+        for (const r of rows) {
+          if (r.dedup_key) existingDedupKeys.add(r.dedup_key);
+        }
+      }
+
+      // Per-row account resolution
+      const accountCache = new Map<string, number>();
+
+      for (let idx = 0; idx < transactions.length; idx++) {
+        const tx = transactions[idx];
+        const dedupKey = dedupKeys[idx];
+
+        if (dedupKey && existingDedupKeys.has(dedupKey)) {
+          duplicates++;
+          continue;
+        }
+
+        // Resolve account for this transaction (user-scoped)
+        const accountKey = tx.iban || tx.account_number || '';
+        let accountId: number | null = null;
+        if (accountKey) {
+          if (accountCache.has(accountKey)) {
+            accountId = accountCache.get(accountKey)!;
+          } else {
+            accountId = await findOrCreateAccount(tx, userId);
+            accountCache.set(accountKey, accountId);
+          }
+        }
+
         const category = categorizeWithRules(tx.description || '', tx.counterparty || '', dbRules);
         try {
           await prisma.transaction.create({
@@ -94,15 +234,24 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
               description: tx.description,
               counterparty: tx.counterparty,
               counterparty_iban: tx.counterparty_iban,
+              counterparty_bic: tx.counterparty_bic,
+              purpose: tx.purpose,
+              currency: tx.currency,
+              balance_after: tx.balance_after,
+              creditor_id: tx.creditor_id,
+              mandate_reference: tx.mandate_reference,
+              original_category: tx.original_category,
               amount: tx.amount,
               direction: tx.direction,
               category: category,
               source_file: tx.source_file,
               hash: tx.hash,
+              dedup_key: dedupKey,
               account_id: accountId,
             },
           });
           imported++;
+          if (dedupKey) existingDedupKeys.add(dedupKey);
         } catch (e: any) {
           if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
             skipped++;
@@ -118,10 +267,11 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
           imported_at: new Date().toISOString(),
           records_imported: imported,
           records_skipped: skipped,
+          userId,
         },
       });
 
-      results.push({ filename: file.originalname, imported, skipped, total: transactions.length, bank: detectedBank });
+      results.push({ filename: file.originalname, imported, skipped, duplicates: duplicates + skipped, total: transactions.length, bank: detectedBank });
     }
 
     res.json({ success: true, results });
@@ -131,16 +281,21 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
   }
 });
 
-// Helper: build account filter SQL clause
-function accountFilterSql(params: any[], query: Record<string, string>): string {
+// Helper: build account filter SQL clause (user-scoped)
+// Requires the main query to use INNER JOIN bank_accounts a ON t.account_id = a.id
+function accountFilterSql(params: any[], query: Record<string, string>, userId: string): string {
+  let sql = ' AND a.userId = ?';
+  params.push(userId);
+
   const { account_id, include_savings } = query;
-  let sql = '';
   if (account_id) {
     sql += ' AND t.account_id = ?';
     params.push(parseInt(account_id));
-  } else if (include_savings !== 'true') {
-    // Exclude savings accounts by default
-    sql += ' AND (t.account_id IS NULL OR t.account_id NOT IN (SELECT id FROM accounts WHERE account_type = \'savings\'))';
+  } else {
+    sql += ' AND a.is_active = 1';
+    if (include_savings !== 'true') {
+      sql += " AND a.account_type != 'savings'";
+    }
   }
   return sql;
 }
@@ -148,12 +303,13 @@ function accountFilterSql(params: any[], query: Record<string, string>): string 
 // Get transactions with optional filters
 router.get('/transactions', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { month, year, direction, category, search, limit = '500', account_id, include_savings } = req.query as Record<string, string>;
 
-    let sql = 'SELECT t.*, a.bank as bank_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE 1=1';
+    let sql = 'SELECT t.*, a.bank as bank_name FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE 1=1';
     const params: any[] = [];
 
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
     if (direction) { sql += ' AND t.direction = ?'; params.push(direction); }
@@ -173,6 +329,7 @@ router.get('/transactions', async (req: Request, res: Response) => {
 // Monthly overview
 router.get('/analysis/monthly', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { account_id, include_savings } = req.query as Record<string, string>;
     let sql = `
       SELECT
@@ -181,10 +338,11 @@ router.get('/analysis/monthly', async (req: Request, res: Response) => {
         SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) as expenses,
         COUNT(*) as count
       FROM transactions t
+      INNER JOIN bank_accounts a ON t.account_id = a.id
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     sql += ' GROUP BY month ORDER BY month ASC';
 
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -197,6 +355,7 @@ router.get('/analysis/monthly', async (req: Request, res: Response) => {
 // Category breakdown
 router.get('/analysis/categories', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { year, month, direction = 'debit', account_id, include_savings } = req.query as Record<string, string>;
 
     let sql = `
@@ -205,12 +364,13 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
         COUNT(*) as count,
         COALESCE(c.category_type, 'default') as category_type
       FROM transactions t
-      LEFT JOIN categories c ON c.name = t.category
+      INNER JOIN bank_accounts a ON t.account_id = a.id
+      LEFT JOIN categories c ON c.name = t.category AND c.userId = ?
       WHERE t.direction = ?
     `;
-    const params: any[] = [direction];
+    const params: any[] = [userId, direction];
 
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
 
@@ -225,6 +385,7 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
 // Stats summary
 router.get('/analysis/summary', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { account_id, include_savings } = req.query as Record<string, string>;
     let sql = `
       SELECT
@@ -234,13 +395,15 @@ router.get('/analysis/summary', async (req: Request, res: Response) => {
         MIN(t.bu_date) as earliest,
         MAX(t.bu_date) as latest
       FROM transactions t
+      INNER JOIN bank_accounts a ON t.account_id = a.id
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
 
     const totals: any[] = await prisma.$queryRawUnsafe(sql, ...params);
     const importLog = await prisma.importLog.findMany({
+      where: { userId },
       orderBy: { imported_at: 'desc' },
     });
     res.json({ stats: serialize(totals[0]), imports: importLog });
@@ -252,31 +415,36 @@ router.get('/analysis/summary', async (req: Request, res: Response) => {
 // Update category for a transaction
 router.patch('/transactions/:id/category', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { category } = req.body;
-    await prisma.transaction.update({
-      where: { id: parseInt(req.params.id as string) },
-      data: { category },
-    });
+    const txId = parseInt(req.params.id as string);
+    // Verify ownership
+    const tx = await prisma.transaction.findFirst({ where: { id: txId, account: { userId } } });
+    if (!tx) return res.status(404).json({ error: 'Transaktion nicht gefunden' });
+    await prisma.transaction.update({ where: { id: txId }, data: { category } });
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get all available categories
-router.get('/categories', async (_req: Request, res: Response) => {
+// Get all available categories (user-scoped)
+router.get('/categories', async (req: Request, res: Response) => {
   try {
-    const rows = await prisma.category.findMany({ orderBy: { name: 'asc' } });
+    const userId = getUserId(req);
+    const rows = await prisma.category.findMany({ where: { userId }, orderBy: { name: 'asc' } });
     res.json(rows.map(r => r.name));
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// List all accounts with transaction counts
-router.get('/accounts', async (_req: Request, res: Response) => {
+// List all bank accounts with transaction counts (user-scoped)
+router.get('/accounts', async (req: Request, res: Response) => {
   try {
-    const accounts = await prisma.account.findMany({
+    const userId = getUserId(req);
+    const accounts = await prisma.bankAccount.findMany({
+      where: { userId },
       include: { _count: { select: { transactions: true } } },
       orderBy: { created_at: 'desc' },
     });
@@ -290,20 +458,39 @@ router.get('/accounts', async (_req: Request, res: Response) => {
   }
 });
 
-// Update account
+// Update bank account
 router.patch('/accounts/:id', async (req: Request, res: Response) => {
   try {
-    const { name, account_type, bank } = req.body;
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+    const existing = await prisma.bankAccount.findFirst({ where: { id, userId } });
+    if (!existing) return res.status(404).json({ error: 'Konto nicht gefunden' });
+
+    const { name, account_type, bank, is_active } = req.body;
     const data: any = {};
     if (name !== undefined) data.name = name;
     if (account_type !== undefined) data.account_type = account_type;
     if (bank !== undefined) data.bank = bank;
+    if (is_active !== undefined) data.is_active = is_active;
 
-    const account = await prisma.account.update({
-      where: { id: parseInt(req.params.id as string) },
-      data,
-    });
+    const account = await prisma.bankAccount.update({ where: { id }, data });
     res.json(account);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete bank account and its transactions
+router.delete('/accounts/:id', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+    const existing = await prisma.bankAccount.findFirst({ where: { id, userId } });
+    if (!existing) return res.status(404).json({ error: 'Konto nicht gefunden' });
+
+    await prisma.transaction.deleteMany({ where: { account_id: id } });
+    await prisma.bankAccount.delete({ where: { id } });
+    res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -311,13 +498,14 @@ router.patch('/accounts/:id', async (req: Request, res: Response) => {
 
 // ==================== Category Rules CRUD ====================
 
-// List all rules with tx count per category
-router.get('/category-rules', async (_req: Request, res: Response) => {
+// List all rules with tx count per category (user-scoped)
+router.get('/category-rules', async (req: Request, res: Response) => {
   try {
-    const rules = await prisma.categoryRule.findMany({ orderBy: { priority: 'asc' } });
-    // Get tx counts per category
+    const userId = getUserId(req);
+    const rules = await prisma.categoryRule.findMany({ where: { userId }, orderBy: { priority: 'asc' } });
     const counts: any[] = await prisma.$queryRawUnsafe(
-      `SELECT category, COUNT(*) as count FROM transactions GROUP BY category`
+      `SELECT t.category, COUNT(*) as count FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE a.userId = ? GROUP BY t.category`,
+      userId
     );
     const countMap: Record<string, number> = {};
     for (const row of counts) {
@@ -332,9 +520,9 @@ router.get('/category-rules', async (_req: Request, res: Response) => {
 // Create rule
 router.post('/category-rules', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { category, pattern, match_field, match_type, priority } = req.body;
-    await ensureCategoryExists(category);
-    // Validate regex if match_type is regex
+    await ensureCategoryExists(category, userId);
     if (match_type === 'regex') {
       try { new RegExp(pattern); } catch { return res.status(400).json({ error: 'Ungültiger regulärer Ausdruck' }); }
     }
@@ -347,6 +535,7 @@ router.post('/category-rules', async (req: Request, res: Response) => {
         priority: priority ?? 100,
         is_default: false,
         created_at: new Date().toISOString(),
+        userId,
       },
     });
     res.json(rule);
@@ -358,6 +547,11 @@ router.post('/category-rules', async (req: Request, res: Response) => {
 // Update rule
 router.patch('/category-rules/:id', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+    const existing = await prisma.categoryRule.findFirst({ where: { id, userId } });
+    if (!existing) return res.status(404).json({ error: 'Regel nicht gefunden' });
+
     const { category, pattern, match_field, match_type, priority } = req.body;
     if (match_type === 'regex' && pattern) {
       try { new RegExp(pattern); } catch { return res.status(400).json({ error: 'Ungültiger regulärer Ausdruck' }); }
@@ -369,10 +563,7 @@ router.patch('/category-rules/:id', async (req: Request, res: Response) => {
     if (match_type !== undefined) data.match_type = match_type;
     if (priority !== undefined) data.priority = priority;
 
-    const rule = await prisma.categoryRule.update({
-      where: { id: parseInt(req.params.id as string) },
-      data,
-    });
+    const rule = await prisma.categoryRule.update({ where: { id }, data });
     res.json(rule);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -382,22 +573,24 @@ router.patch('/category-rules/:id', async (req: Request, res: Response) => {
 // Delete rule
 router.delete('/category-rules/:id', async (req: Request, res: Response) => {
   try {
-    await prisma.categoryRule.delete({ where: { id: parseInt(req.params.id as string) } });
+    const userId = getUserId(req);
+    const existing = await prisma.categoryRule.findFirst({ where: { id: parseInt(req.params.id as string), userId } });
+    if (!existing) return res.status(404).json({ error: 'Regel nicht gefunden' });
+    await prisma.categoryRule.delete({ where: { id: existing.id } });
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Categories overview with tx counts, totals, rule counts
+// Categories overview with tx counts, totals, rule counts (user-scoped)
 router.get('/categories/overview', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { year, month, account_id, include_savings } = req.query as Record<string, string>;
 
-    // All categories from DB table
-    const allCats = await prisma.category.findMany({ orderBy: { name: 'asc' } });
+    const allCats = await prisma.category.findMany({ where: { userId }, orderBy: { name: 'asc' } });
 
-    // Transaction stats grouped by category (with optional filters)
     let sql = `
       SELECT
         t.category,
@@ -405,10 +598,11 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
         CAST(SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) AS REAL) as total_debit,
         CAST(SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) AS REAL) as total_credit
       FROM transactions t
+      INNER JOIN bank_accounts a ON t.account_id = a.id
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
     sql += ' GROUP BY t.category';
@@ -420,8 +614,7 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
       statsMap[s.category] = s;
     }
 
-    // Rule counts
-    const rules = await prisma.categoryRule.findMany();
+    const rules = await prisma.categoryRule.findMany({ where: { userId } });
     const ruleCountMap: Record<string, number> = {};
     for (const r of rules) {
       ruleCountMap[r.category] = (ruleCountMap[r.category] || 0) + 1;
@@ -438,7 +631,6 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
       rule_count: ruleCountMap[c.name] || 0,
     }));
 
-    // Sort: categories with transactions first (by tx_count DESC), then empty ones alphabetically
     result.sort((a, b) => {
       if (a.tx_count > 0 && b.tx_count === 0) return -1;
       if (a.tx_count === 0 && b.tx_count > 0) return 1;
@@ -457,17 +649,18 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
 // Create a new category
 router.post('/categories', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { name } = req.body;
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ error: 'Name darf nicht leer sein' });
     }
     const trimmed = name.trim();
-    const existing = await prisma.category.findUnique({ where: { name: trimmed } });
+    const existing = await prisma.category.findFirst({ where: { name: trimmed, userId } });
     if (existing) {
       return res.status(409).json({ error: 'Kategorie existiert bereits' });
     }
     const cat = await prisma.category.create({
-      data: { name: trimmed, is_default: false, created_at: new Date().toISOString() },
+      data: { name: trimmed, is_default: false, userId, created_at: new Date().toISOString() },
     });
     res.json(cat);
   } catch (err: any) {
@@ -478,19 +671,18 @@ router.post('/categories', async (req: Request, res: Response) => {
 // Update a category (rename and/or change type)
 router.patch('/categories/:id', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const id = parseInt(req.params.id as string);
     const { name, category_type } = req.body;
-    const cat = await prisma.category.findUnique({ where: { id } });
+    const cat = await prisma.category.findFirst({ where: { id, userId } });
     if (!cat) return res.status(404).json({ error: 'Kategorie nicht gefunden' });
 
     const data: any = {};
 
-    // Handle category_type change
     if (category_type !== undefined && ['default', 'savings'].includes(category_type)) {
       data.category_type = category_type;
     }
 
-    // Handle rename
     if (name !== undefined) {
       if (typeof name !== 'string' || name.trim().length === 0) {
         return res.status(400).json({ error: 'Name darf nicht leer sein' });
@@ -499,7 +691,7 @@ router.patch('/categories/:id', async (req: Request, res: Response) => {
 
       const trimmed = name.trim();
       if (trimmed !== cat.name) {
-        const duplicate = await prisma.category.findUnique({ where: { name: trimmed } });
+        const duplicate = await prisma.category.findFirst({ where: { name: trimmed, userId } });
         if (duplicate) return res.status(409).json({ error: 'Kategorie existiert bereits' });
         data.name = trimmed;
       }
@@ -509,15 +701,15 @@ router.patch('/categories/:id', async (req: Request, res: Response) => {
 
     const updated = await prisma.category.update({ where: { id }, data });
 
-    // If renamed, cascade to transactions and rules
+    // If renamed, cascade to transactions and rules (scoped to user)
     if (data.name && data.name !== cat.name) {
       await prisma.$executeRawUnsafe(
-        'UPDATE transactions SET category = ? WHERE category = ?',
-        data.name, cat.name
+        `UPDATE transactions SET category = ? WHERE category = ? AND account_id IN (SELECT id FROM bank_accounts WHERE userId = ?)`,
+        data.name, cat.name, userId
       );
       await prisma.$executeRawUnsafe(
-        'UPDATE category_rules SET category = ? WHERE category = ?',
-        data.name, cat.name
+        `UPDATE category_rules SET category = ? WHERE category = ? AND userId = ?`,
+        data.name, cat.name, userId
       );
     }
 
@@ -530,27 +722,24 @@ router.patch('/categories/:id', async (req: Request, res: Response) => {
 // Delete a category (reassign transactions + rules to replacement)
 router.post('/categories/:id/delete', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const id = parseInt(req.params.id as string);
     const { replacement_category } = req.body;
-    const cat = await prisma.category.findUnique({ where: { id } });
+    const cat = await prisma.category.findFirst({ where: { id, userId } });
     if (!cat) return res.status(404).json({ error: 'Kategorie nicht gefunden' });
     if (cat.name === 'Sonstiges') return res.status(400).json({ error: '"Sonstiges" kann nicht gelöscht werden' });
 
     const replacement = replacement_category || 'Sonstiges';
-    // Ensure replacement exists
-    await ensureCategoryExists(replacement);
+    await ensureCategoryExists(replacement, userId);
 
-    // Reassign transactions
     const txUpdated = await prisma.$executeRawUnsafe(
-      'UPDATE transactions SET category = ? WHERE category = ?',
-      replacement, cat.name
+      `UPDATE transactions SET category = ? WHERE category = ? AND account_id IN (SELECT id FROM bank_accounts WHERE userId = ?)`,
+      replacement, cat.name, userId
     );
-    // Reassign rules
     await prisma.$executeRawUnsafe(
-      'UPDATE category_rules SET category = ? WHERE category = ?',
-      replacement, cat.name
+      `UPDATE category_rules SET category = ? WHERE category = ? AND userId = ?`,
+      replacement, cat.name, userId
     );
-    // Delete category
     await prisma.category.delete({ where: { id } });
 
     res.json({ success: true, reassigned_transactions: txUpdated });
@@ -559,11 +748,12 @@ router.post('/categories/:id/delete', async (req: Request, res: Response) => {
   }
 });
 
-// Recategorize preview — returns count + sample transactions
+// Recategorize preview
 router.post('/transactions/recategorize/preview', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { transaction_id, category, mode } = req.body;
-    const tx = await prisma.transaction.findUnique({ where: { id: transaction_id } });
+    const tx = await prisma.transaction.findFirst({ where: { id: transaction_id, account: { userId } } });
     if (!tx) return res.status(404).json({ error: 'Transaktion nicht gefunden' });
 
     let where = '';
@@ -586,10 +776,10 @@ router.post('/transactions/recategorize/preview', async (req: Request, res: Resp
     }
 
     const countResult: any[] = await prisma.$queryRawUnsafe(
-      `SELECT COUNT(*) as cnt FROM transactions t WHERE ${where}`, ...params
+      `SELECT COUNT(*) as cnt FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE a.userId = ? AND ${where}`, userId, ...params
     );
     const samples: any[] = await prisma.$queryRawUnsafe(
-      `SELECT t.*, a.bank as bank_name FROM transactions t LEFT JOIN accounts a ON t.account_id = a.id WHERE ${where} LIMIT 5`, ...params
+      `SELECT t.*, a.bank as bank_name FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE a.userId = ? AND ${where} LIMIT 5`, userId, ...params
     );
 
     res.json(serialize({
@@ -604,12 +794,14 @@ router.post('/transactions/recategorize/preview', async (req: Request, res: Resp
 // Recategorize — bulk update
 router.post('/transactions/recategorize', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { transaction_id, category, mode, create_rule, rule } = req.body;
-    const tx = await prisma.transaction.findUnique({ where: { id: transaction_id } });
+    const tx = await prisma.transaction.findFirst({ where: { id: transaction_id, account: { userId } } });
     if (!tx) return res.status(404).json({ error: 'Transaktion nicht gefunden' });
 
-    await ensureCategoryExists(category);
+    await ensureCategoryExists(category, userId);
 
+    const userAccountFilter = `AND account_id IN (SELECT id FROM bank_accounts WHERE userId = ?)`;
     let updated = 0;
 
     if (mode === 'single') {
@@ -617,20 +809,19 @@ router.post('/transactions/recategorize', async (req: Request, res: Response) =>
       updated = 1;
     } else if (mode === 'counterparty') {
       const result = await prisma.$executeRawUnsafe(
-        'UPDATE transactions SET category = ? WHERE counterparty = ?',
-        category, tx.counterparty || ''
+        `UPDATE transactions SET category = ? WHERE counterparty = ? ${userAccountFilter}`,
+        category, tx.counterparty || '', userId
       );
       updated = result;
     } else if (mode === 'pattern') {
       const amt = Math.abs(tx.amount || 0);
       const result = await prisma.$executeRawUnsafe(
-        'UPDATE transactions SET category = ? WHERE counterparty = ? AND amount BETWEEN ? AND ?',
-        category, tx.counterparty || '', amt * 0.8, amt * 1.2
+        `UPDATE transactions SET category = ? WHERE counterparty = ? AND amount BETWEEN ? AND ? ${userAccountFilter}`,
+        category, tx.counterparty || '', amt * 0.8, amt * 1.2, userId
       );
       updated = result;
     }
 
-    // Optionally create a rule
     if (create_rule && rule) {
       if (rule.match_type === 'regex') {
         try { new RegExp(rule.pattern); } catch { return res.status(400).json({ error: 'Ungültiger regulärer Ausdruck' }); }
@@ -644,6 +835,7 @@ router.post('/transactions/recategorize', async (req: Request, res: Response) =>
           priority: rule.priority ?? 100,
           is_default: false,
           created_at: new Date().toISOString(),
+          userId,
         },
       });
     }
@@ -657,16 +849,16 @@ router.post('/transactions/recategorize', async (req: Request, res: Response) =>
 // AI suggest pattern
 router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { transaction_id, category } = req.body;
-    const tx = await prisma.transaction.findUnique({ where: { id: transaction_id } });
+    const tx = await prisma.transaction.findFirst({ where: { id: transaction_id, account: { userId } } });
     if (!tx) return res.status(404).json({ error: 'Transaktion nicht gefunden' });
 
-    // Get similar transactions for context
     const samples: any[] = await prisma.$queryRawUnsafe(
-      `SELECT description, counterparty, amount FROM transactions
-       WHERE counterparty = ? OR description LIKE ?
+      `SELECT t.description, t.counterparty, t.amount FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id
+       WHERE a.userId = ? AND (t.counterparty = ? OR t.description LIKE ?)
        LIMIT 5`,
-      tx.counterparty || '', `%${(tx.counterparty || '').substring(0, 10)}%`
+      userId, tx.counterparty || '', `%${(tx.counterparty || '').substring(0, 10)}%`
     );
 
     const result = await suggestCategoryPattern({
@@ -679,7 +871,6 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
     res.json(result);
   } catch (err: any) {
     console.error('AI suggest-pattern error:', err.message || err);
-    // Fallback: simple counterparty-based pattern
     const tx = await prisma.transaction.findUnique({ where: { id: req.body.transaction_id } });
     const escaped = (tx?.counterparty || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -707,18 +898,20 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
 // Step 1: Return grouped "Sonstiges" transactions (no AI, instant)
 router.post('/ai/batch-groups', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { limit = 50, year, month, account_id, include_savings } = req.body || {};
 
     const catRows = await prisma.category.findMany({
-      where: { NOT: { name: 'Sonstiges' } },
+      where: { NOT: { name: 'Sonstiges' }, userId },
       orderBy: { name: 'asc' },
     });
     const existingCategories = catRows.map(r => r.name);
 
-    let sql = `SELECT id, counterparty, description, amount, direction
-       FROM transactions t WHERE category = 'Sonstiges'`;
+    let sql = `SELECT t.id, t.counterparty, t.description, t.amount, t.direction
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id
+       WHERE t.category = 'Sonstiges'`;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(String(month).padStart(2, '0')); }
     sql += ' ORDER BY t.bu_date DESC';
@@ -783,6 +976,7 @@ router.post('/ai/batch-categorize', async (req: Request, res: Response) => {
 // Batch apply categorization changes
 router.post('/ai/batch-apply', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { actions } = req.body as {
       actions: Array<{
         counterparty: string;
@@ -793,30 +987,30 @@ router.post('/ai/batch-apply', async (req: Request, res: Response) => {
       }>;
     };
 
+    const userAccountFilter = `AND account_id IN (SELECT id FROM bank_accounts WHERE userId = ?)`;
     let updatedTransactions = 0;
     let rulesCreated = 0;
 
     for (const action of actions) {
-      await ensureCategoryExists(action.category);
-      // Update transactions
+      await ensureCategoryExists(action.category, userId);
       if (action.transaction_ids.length > 0) {
         const placeholders = action.transaction_ids.map(() => '?').join(',');
         const result = await prisma.$executeRawUnsafe(
-          `UPDATE transactions SET category = ? WHERE id IN (${placeholders})`,
+          `UPDATE transactions SET category = ? WHERE id IN (${placeholders}) ${userAccountFilter}`,
           action.category,
           ...action.transaction_ids,
+          userId,
         );
         updatedTransactions += result;
       }
 
-      // Create rule if requested
       if (action.create_rule && action.rule) {
-        // Check for duplicate
         const existing = await prisma.categoryRule.findFirst({
           where: {
             pattern: action.rule.pattern,
             match_field: action.rule.match_field,
             category: action.category,
+            userId,
           },
         });
         if (!existing) {
@@ -832,6 +1026,7 @@ router.post('/ai/batch-apply', async (req: Request, res: Response) => {
               priority: 100,
               is_default: false,
               created_at: new Date().toISOString(),
+              userId,
             },
           });
           rulesCreated++;
@@ -846,13 +1041,37 @@ router.post('/ai/batch-apply', async (req: Request, res: Response) => {
   }
 });
 
-// ── AI Model Settings ───────────────────────────────────────────────
+// ── AI Template Generation ──────────────────────────────────────────
 
-router.get('/settings/ai-model', async (_req: Request, res: Response) => {
+router.post('/ai/generate-template', async (req: Request, res: Response) => {
   try {
+    let { csvSample } = req.body as { csvSample: string };
+    if (!csvSample || typeof csvSample !== 'string' || csvSample.trim().length < 10) {
+      res.status(400).json({ error: 'CSV-Daten zu kurz oder fehlen.' });
+      return;
+    }
+    const lines = csvSample.split('\n').slice(0, 50);
+    csvSample = lines.join('\n').slice(0, 10_000);
+
+    const config = await generateTemplateConfig(csvSample);
+    res.json({ config });
+  } catch (err: any) {
+    const isNoKey = err.message?.includes('OPENROUTER_API_KEY');
+    res.status(isNoKey ? 400 : 500).json({
+      error: err.message,
+      code: isNoKey ? 'NO_API_KEY' : undefined,
+    });
+  }
+});
+
+// ── AI Model Settings (user-scoped) ─────────────────────────────────
+
+router.get('/settings/ai-model', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
     const [setting, customModels, zdrIds, availableIds] = await Promise.all([
-      prisma.setting.findUnique({ where: { key: 'ai_model' } }),
-      prisma.setting.findUnique({ where: { key: 'custom_models' } }),
+      prisma.setting.findFirst({ where: { key: 'ai_model', userId } }),
+      prisma.setting.findFirst({ where: { key: 'custom_models', userId } }),
       fetchZdrModelIds().catch(() => new Set<string>()),
       fetchAvailableModelIds(),
     ]);
@@ -873,15 +1092,12 @@ router.get('/settings/ai-model', async (_req: Request, res: Response) => {
 
 router.patch('/settings/ai-model', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { model } = req.body;
     if (!model || typeof model !== 'string') {
       return res.status(400).json({ error: 'Model ID erforderlich' });
     }
-    await prisma.setting.upsert({
-      where: { key: 'ai_model' },
-      update: { value: model.trim() },
-      create: { key: 'ai_model', value: model.trim() },
-    });
+    await upsertSetting('ai_model', model.trim(), userId);
     res.json({ success: true, model: model.trim() });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -899,20 +1115,17 @@ router.get('/settings/ai-model/browse', async (_req: Request, res: Response) => 
 
 router.post('/settings/ai-model/custom', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { model } = req.body;
     if (!model || typeof model !== 'string' || !model.includes('/')) {
       return res.status(400).json({ error: 'Model ID im Format "provider/model-name" erforderlich' });
     }
-    const existing = await prisma.setting.findUnique({ where: { key: 'custom_models' } });
+    const existing = await prisma.setting.findFirst({ where: { key: 'custom_models', userId } });
     const custom: string[] = existing?.value ? JSON.parse(existing.value) : [];
     const trimmed = model.trim();
     if (!custom.includes(trimmed)) {
       custom.push(trimmed);
-      await prisma.setting.upsert({
-        where: { key: 'custom_models' },
-        update: { value: JSON.stringify(custom) },
-        create: { key: 'custom_models', value: JSON.stringify(custom) },
-      });
+      await upsertSetting('custom_models', JSON.stringify(custom), userId);
     }
     res.json({ success: true, custom });
   } catch (err: any) {
@@ -922,15 +1135,12 @@ router.post('/settings/ai-model/custom', async (req: Request, res: Response) => 
 
 router.delete('/settings/ai-model/custom', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { model } = req.body;
-    const existing = await prisma.setting.findUnique({ where: { key: 'custom_models' } });
+    const existing = await prisma.setting.findFirst({ where: { key: 'custom_models', userId } });
     const custom: string[] = existing?.value ? JSON.parse(existing.value) : [];
     const filtered = custom.filter(m => m !== model);
-    await prisma.setting.upsert({
-      where: { key: 'custom_models' },
-      update: { value: JSON.stringify(filtered) },
-      create: { key: 'custom_models', value: JSON.stringify(filtered) },
-    });
+    await upsertSetting('custom_models', JSON.stringify(filtered), userId);
     res.json({ success: true, custom: filtered });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -940,59 +1150,54 @@ router.delete('/settings/ai-model/custom', async (req: Request, res: Response) =
 // ── Analysis: Flow (Sankey) ─────────────────────────────────────────
 router.get('/analysis/flow', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { year, month, account_id, include_savings } = req.query as Record<string, string>;
 
     let baseSql = ' WHERE 1=1';
     const params: any[] = [];
-    baseSql += accountFilterSql(params, { account_id, include_savings });
+    baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { baseSql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
 
-    // Income: group by counterparty_iban where available, fall back to counterparty text
     const incomeByIban: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.counterparty_iban as group_key, MIN(t.counterparty) as label, CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NOT NULL
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NOT NULL
        GROUP BY t.counterparty_iban ORDER BY total DESC LIMIT 10`,
       ...params,
     );
     const incomeByText: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.counterparty as group_key, t.counterparty as label, CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NULL
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql} AND t.direction = 'credit' AND t.counterparty_iban IS NULL
        GROUP BY t.counterparty ORDER BY total DESC LIMIT 10`,
       ...params,
     );
-    // Merge, deduplicate, top 10
     const incomeRows = [...incomeByIban, ...incomeByText]
       .sort((a, b) => (Number(b.total) || 0) - (Number(a.total) || 0))
       .slice(0, 10)
       .map(r => ({ counterparty: r.label || 'Unbekannt', total: r.total }));
 
-    // Remaining income → "Sonstige Einnahmen"
     const incomeTotal: any[] = await prisma.$queryRawUnsafe(
       `SELECT CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql} AND t.direction = 'credit'`,
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql} AND t.direction = 'credit'`,
       ...params,
     );
     const topIncomeTotal = incomeRows.reduce((s: number, r: any) => s + (Number(r.total) || 0), 0);
     const allIncomeTotal = Number(incomeTotal[0]?.total) || 0;
     const otherIncome = allIncomeTotal - topIncomeTotal;
 
-    // Expenses by category
     const expenseRows: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql} AND t.direction = 'debit'
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql} AND t.direction = 'debit'
        GROUP BY t.category ORDER BY total DESC`,
       ...params,
     );
 
-    // Build Sankey nodes & links
     const incomeColors = ['#0D9373', '#10B981', '#34D399', '#6EE7B7', '#A7F3D0', '#22C55E', '#16A34A', '#15803D', '#4ADE80', '#86EFAC'];
     const expenseColors = ['#DC5944', '#D4930D', '#7C5CDB', '#E07B53', '#3BA0A8', '#A85C9E', '#6B9E42', '#C7633D', '#4A7AE5', '#9CA3AF'];
 
     const nodes: { id: string; label: string; color: string }[] = [];
     const links: { source: string; target: string; value: number }[] = [];
 
-    // Income source nodes
     for (let i = 0; i < incomeRows.length; i++) {
       const r = incomeRows[i];
       const name = r.counterparty || 'Unbekannt';
@@ -1005,10 +1210,8 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
       links.push({ source: 'in_other', target: 'konto', value: otherIncome });
     }
 
-    // Account node
     nodes.push({ id: 'konto', label: 'Konto', color: '#4A7AE5' });
 
-    // Expense category nodes
     for (let i = 0; i < expenseRows.length; i++) {
       const r = expenseRows[i];
       const id = `out_${i}`;
@@ -1016,7 +1219,6 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
       links.push({ source: 'konto', target: id, value: Number(r.total) || 0 });
     }
 
-    // Filter out zero-value links and orphan nodes
     const validLinks = links.filter(l => l.value > 0);
     const usedNodeIds = new Set(validLinks.flatMap(l => [l.source, l.target]));
     const validNodes = nodes.filter(n => usedNodeIds.has(n.id));
@@ -1030,16 +1232,18 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
 // ── Analysis: Daily spending (Calendar heatmap) ─────────────────────
 router.get('/analysis/daily', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { year, account_id, include_savings } = req.query as Record<string, string>;
     const targetYear = year || String(new Date().getFullYear());
 
     let sql = `
       SELECT t.bu_date as day, CAST(SUM(t.amount) AS REAL) as value
       FROM transactions t
+      INNER JOIN bank_accounts a ON t.account_id = a.id
       WHERE t.direction = 'debit' AND strftime('%Y', t.bu_date) = ?
     `;
     const params: any[] = [targetYear];
-    sql += accountFilterSql(params, { account_id, include_savings });
+    sql += accountFilterSql(params, { account_id, include_savings }, userId);
     sql += ' GROUP BY t.bu_date ORDER BY t.bu_date ASC';
 
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -1052,31 +1256,29 @@ router.get('/analysis/daily', async (req: Request, res: Response) => {
 // ── Analysis: Category monthly (Stacked area) ──────────────────────
 router.get('/analysis/category-monthly', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const { year, account_id, include_savings } = req.query as Record<string, string>;
 
     let baseSql = ' WHERE t.direction = \'debit\'';
     const params: any[] = [];
-    baseSql += accountFilterSql(params, { account_id, include_savings });
+    baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
     if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
 
-    // Pass 1: top 8 categories by total
     const topCats: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql}
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql}
        GROUP BY t.category ORDER BY total DESC LIMIT 8`,
       ...params,
     );
     const topCatNames = new Set(topCats.map((r: any) => r.category));
 
-    // Pass 2: monthly breakdown
     const monthlyRows: any[] = await prisma.$queryRawUnsafe(
       `SELECT strftime('%Y-%m', t.bu_date) as month, t.category, CAST(SUM(t.amount) AS REAL) as total
-       FROM transactions t ${baseSql}
+       FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id ${baseSql}
        GROUP BY month, t.category ORDER BY month ASC`,
       ...params,
     );
 
-    // Aggregate
     const monthMap = new Map<string, Record<string, number>>();
     for (const row of monthlyRows) {
       if (!row.month) continue;
@@ -1097,10 +1299,12 @@ router.get('/analysis/category-monthly', async (req: Request, res: Response) => 
 });
 
 // ── Backfill: Extract counterparty_iban from existing transaction descriptions ──
-router.post('/backfill/counterparty-iban', async (_req: Request, res: Response) => {
+router.post('/backfill/counterparty-iban', async (req: Request, res: Response) => {
   try {
+    const userId = getUserId(req);
     const transactions: any[] = await prisma.$queryRawUnsafe(
-      `SELECT id, description FROM transactions WHERE description IS NOT NULL`
+      `SELECT t.id, t.description FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE a.userId = ? AND t.description IS NOT NULL`,
+      userId
     );
     let updated = 0;
     for (const tx of transactions) {
@@ -1124,22 +1328,107 @@ router.post('/backfill/counterparty-iban', async (_req: Request, res: Response) 
   }
 });
 
-// ── Reset: Delete all data and re-seed default category rules + categories ───
-router.delete('/reset', async (_req: Request, res: Response) => {
-  await prisma.transaction.deleteMany();
-  await prisma.importLog.deleteMany();
-  await prisma.account.deleteMany();
-  await prisma.categoryRule.deleteMany();
-  await prisma.category.deleteMany();
+// ── Bank Templates CRUD ─────────────────────────────────────────────
 
-  // Re-seed default categories
+router.get('/bank-templates', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  const templates = await prisma.bankTemplate.findMany({
+    where: { OR: [{ userId }, { is_builtin: true }] },
+  });
+  res.json(templates.map(t => ({ ...t, config: JSON.parse(t.config) })));
+});
+
+router.get('/bank-templates/:id', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  const id = req.params.id as string;
+  const template = await prisma.bankTemplate.findFirst({ where: { id, OR: [{ userId }, { is_builtin: true }] } });
+  if (!template) { res.status(404).json({ error: 'Template not found' }); return; }
+  res.json({ ...template, config: JSON.parse(template.config) });
+});
+
+router.post('/bank-templates', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  const { id, name, config } = req.body;
+  if (!id || !name || !config) { res.status(400).json({ error: 'id, name, config required' }); return; }
+  const template = await prisma.bankTemplate.create({
+    data: {
+      id,
+      name,
+      config: JSON.stringify(config),
+      is_builtin: false,
+      enabled: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      userId,
+    },
+  });
+  invalidateTemplateCache();
+  res.json({ ...template, config: JSON.parse(template.config) });
+});
+
+router.patch('/bank-templates/:id', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  const id = req.params.id as string;
+  const existing = await prisma.bankTemplate.findFirst({ where: { id, OR: [{ userId }, { is_builtin: true }] } });
+  if (!existing) { res.status(404).json({ error: 'Template not found' }); return; }
+
+  const { name, config, enabled } = req.body;
+  const data: any = { updated_at: new Date().toISOString() };
+  if (name !== undefined) data.name = name;
+  if (config !== undefined) data.config = JSON.stringify(config);
+  if (enabled !== undefined) data.enabled = enabled;
+  const template = await prisma.bankTemplate.update({ where: { id }, data });
+  invalidateTemplateCache();
+  res.json({ ...template, config: JSON.parse(template.config) });
+});
+
+router.delete('/bank-templates/:id', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  const id = req.params.id as string;
+  const template = await prisma.bankTemplate.findFirst({ where: { id, userId } });
+  if (!template) { res.status(404).json({ error: 'Template not found' }); return; }
+  if (template.is_builtin) { res.status(400).json({ error: 'Cannot delete builtin template' }); return; }
+  await prisma.bankTemplate.delete({ where: { id } });
+  invalidateTemplateCache();
+  res.json({ success: true });
+});
+
+router.post('/bank-templates/test', async (req: Request, res: Response) => {
+  const { config, csvText, bankName } = req.body;
+  if (!config || !csvText) { res.status(400).json({ error: 'config, csvText required' }); return; }
+  try {
+    const templateConfig = config as BankTemplateConfig;
+    const transactions = parseWithTemplate(templateConfig, bankName || 'Test', csvText, 'test.csv');
+    res.json({ transactions: transactions.slice(0, 20), total: transactions.length });
+  } catch (e: any) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// ── Reset: Delete current user's data and re-seed defaults ───────────
+router.delete('/reset', async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+
+  // Delete user's transactions (through their bank accounts)
+  const userAccountIds = (await prisma.bankAccount.findMany({ where: { userId }, select: { id: true } })).map(a => a.id);
+  if (userAccountIds.length > 0) {
+    await prisma.transaction.deleteMany({ where: { account_id: { in: userAccountIds } } });
+  }
+
+  await prisma.importLog.deleteMany({ where: { userId } });
+  await prisma.bankAccount.deleteMany({ where: { userId } });
+  await prisma.categoryRule.deleteMany({ where: { userId } });
+  await prisma.category.deleteMany({ where: { userId } });
+  await prisma.bankTemplate.deleteMany({ where: { userId, is_builtin: false } });
+
+  // Re-seed default categories for this user
   for (const cat of DEFAULT_CATEGORIES) {
     await prisma.category.create({
-      data: { name: cat.name, is_default: true, category_type: cat.type, created_at: new Date().toISOString() },
+      data: { name: cat.name, is_default: true, category_type: cat.type, userId, created_at: new Date().toISOString() },
     });
   }
 
-  // Re-seed default category rules
+  // Re-seed default category rules for this user
   for (let i = 0; i < DEFAULT_RULES.length; i++) {
     const rule = DEFAULT_RULES[i];
     await prisma.categoryRule.create({
@@ -1150,10 +1439,15 @@ router.delete('/reset', async (_req: Request, res: Response) => {
         match_type: 'regex',
         priority: (i + 1) * 10,
         is_default: true,
+        userId,
         created_at: new Date().toISOString(),
       },
     });
   }
+
+  // Re-seed builtin bank templates (global, not user-scoped)
+  await ensureBuiltinTemplates();
+  invalidateTemplateCache();
 
   res.json({ ok: true });
 });

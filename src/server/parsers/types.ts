@@ -12,6 +12,13 @@ export interface ParsedTransaction {
   category: string;
   source_file: string;
   counterparty_iban: string | null;
+  counterparty_bic: string | null;
+  purpose: string | null;
+  currency: string | null;
+  balance_after: number | null;
+  creditor_id: string | null;
+  mandate_reference: string | null;
+  original_category: string | null;
   hash: string;
   iban: string | null;
   bank_name: string;
@@ -23,6 +30,56 @@ export interface BankParser {
   detect(text: string): boolean;
   parse(text: string, filename: string): ParsedTransaction[];
 }
+
+// ── Template Config interfaces ──────────────────────────────────────
+
+export interface ColumnMapping {
+  column: string;
+  fallbackIndex?: number;
+  defaultValue?: string;
+  joinColumns?: string[];
+  joinSeparator?: string;
+}
+
+export interface FallbackRule {
+  field: string;
+  when: 'empty';
+  copyFrom: string;
+}
+
+export interface BankTemplateConfig {
+  detection: {
+    headerStartsWith: string;
+  };
+  csv: {
+    delimiter: 'auto' | ';' | ',';
+    minColumnsPerRow: number;
+  };
+  columns: {
+    account_number?: ColumnMapping;
+    iban?: ColumnMapping;
+    bank_name?: ColumnMapping;
+    bu_date: ColumnMapping;
+    value_date?: ColumnMapping;
+    type?: ColumnMapping;
+    counterparty: ColumnMapping;
+    counterparty_iban?: ColumnMapping;
+    counterparty_bic?: ColumnMapping;
+    purpose?: ColumnMapping;
+    amount: ColumnMapping;
+    currency?: ColumnMapping;
+    balance_after?: ColumnMapping;
+    creditor_id?: ColumnMapping;
+    mandate_reference?: ColumnMapping;
+    original_category?: ColumnMapping;
+  };
+  descriptionTemplate: string;
+  hashFields: string[];
+  typeMap?: Record<string, string>;
+  fallbacks?: FallbackRule[];
+}
+
+// ── Category Rules ──────────────────────────────────────────────────
 
 export const CATEGORY_RULES: [RegExp, string][] = [
   [/REWE|LIDL|ALDI|NETTO|KAUFLAND|EDEKA|PENNY|NORMA/i, 'Lebensmittel'],
@@ -102,18 +159,6 @@ export function extractCounterpartyIban(text: string): string | null {
   return iban.length >= 15 && iban.length <= 34 ? iban : null;
 }
 
-export function parseAmount(amountStr: string): number {
-  return parseFloat(amountStr.replace(/\./g, '').replace(',', '.'));
-}
-
-export function parseDate(dateStr: string, year: string): string | null {
-  const clean = dateStr.trim().replace(/\.$/, '');
-  const parts = clean.split('.');
-  if (parts.length >= 2) {
-    return `${year}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-  }
-  return null;
-}
 
 export function computeHash(parts: string[]): string {
   return crypto.createHash('md5').update(parts.join('|')).digest('hex');

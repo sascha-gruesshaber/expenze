@@ -1,4 +1,6 @@
 import { prisma } from './prisma.js';
+import { BUILTIN_TEMPLATES } from './parsers/builtin-templates.js';
+import type { BankTemplateConfig } from './parsers/types.js';
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'google/gemini-3.1-flash-lite-preview';
@@ -145,7 +147,7 @@ export async function fetchAllModels(): Promise<{ models: BrowseModel[]; provide
 }
 
 async function getModel(): Promise<string> {
-  const setting = await prisma.setting.findUnique({ where: { key: 'ai_model' } });
+  const setting = await prisma.setting.findFirst({ where: { key: 'ai_model' } });
   return setting?.value || DEFAULT_MODEL;
 }
 
@@ -311,6 +313,116 @@ export async function categorizeGroup(
       count: group.count,
     };
   }
+}
+
+// ── AI Template Generation ──────────────────────────────────────────
+
+function buildTemplatePrompt(csvSample: string): string {
+  const c24Config = JSON.stringify(BUILTIN_TEMPLATES[0].config, null, 2);
+  const vbConfig = JSON.stringify(BUILTIN_TEMPLATES[1].config, null, 2);
+
+  return `Du bist ein Experte für CSV-Bankdaten. Analysiere die folgende CSV-Datei und erzeuge eine BankTemplateConfig als JSON.
+
+## TypeScript-Interface (Schema-Referenz)
+
+interface ColumnMapping {
+  column: string;           // exakter Header-Spaltenname
+  fallbackIndex?: number;   // optionaler Index falls Header-Encoding kaputt
+  defaultValue?: string;    // Standardwert falls Spalte nicht existiert
+  joinColumns?: string[];   // mehrere Spalten zusammenführen
+  joinSeparator?: string;   // Trennzeichen beim Zusammenführen
+}
+
+interface FallbackRule {
+  field: string;
+  when: 'empty';
+  copyFrom: string;
+}
+
+interface BankTemplateConfig {
+  detection: { headerStartsWith: string };  // Anfang der Header-Zeile zur Erkennung
+  csv: { delimiter: 'auto' | ';' | ','; minColumnsPerRow: number };
+  columns: {
+    account_number?: ColumnMapping;
+    iban?: ColumnMapping;
+    bank_name?: ColumnMapping;
+    bu_date: ColumnMapping;       // PFLICHT: Buchungsdatum
+    value_date?: ColumnMapping;
+    type?: ColumnMapping;
+    counterparty: ColumnMapping;  // PFLICHT: Zahlungsempfänger/-auftraggeber
+    counterparty_iban?: ColumnMapping;
+    counterparty_bic?: ColumnMapping;
+    purpose?: ColumnMapping;
+    amount: ColumnMapping;        // PFLICHT: Betrag
+    currency?: ColumnMapping;
+    balance_after?: ColumnMapping;
+    creditor_id?: ColumnMapping;
+    mandate_reference?: ColumnMapping;
+    original_category?: ColumnMapping;
+  };
+  descriptionTemplate: string;   // z.B. '{type} {purpose}'
+  hashFields: string[];          // Felder für Deduplizierung
+  typeMap?: Record<string, string>;
+  fallbacks?: FallbackRule[];
+}
+
+## Beispiel 1: C24 Bank
+${c24Config}
+
+## Beispiel 2: Volksbank
+${vbConfig}
+
+## Regeln
+- Verwende die EXAKTEN Spaltennamen aus dem CSV-Header für "column"
+- detection.headerStartsWith: die ersten Zeichen der Header-Zeile (erstes Feld reicht)
+- Erkenne das Trennzeichen (Semikolon, Komma, oder auto)
+- bu_date, counterparty und amount sind PFLICHT
+- hashFields: mindestens bu_date, amount, direction, counterparty
+- descriptionTemplate: sinnvolle Kombination aus verfügbaren Feldern
+- Falls eine Spalte für Empfänger leer sein könnte, füge eine fallback-Regel hinzu
+- Antworte NUR mit dem JSON-Objekt, kein Markdown, keine Erklärung
+
+## CSV-Daten (Header + Beispielzeilen)
+${csvSample}`;
+}
+
+export async function generateTemplateConfig(csvSample: string): Promise<BankTemplateConfig> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error('OPENROUTER_API_KEY nicht konfiguriert. Bitte in .env setzen.');
+  }
+
+  const model = await getModel();
+  const zdr = await isZdrSupported(model);
+  const prompt = buildTemplatePrompt(csvSample);
+  const parsed = await callWithRetry(apiKey, model, prompt, zdr);
+
+  // Validate required fields
+  if (!parsed.detection?.headerStartsWith) {
+    throw new Error('KI-Antwort fehlt: detection.headerStartsWith');
+  }
+  if (!parsed.columns?.bu_date) {
+    throw new Error('KI-Antwort fehlt: columns.bu_date');
+  }
+  if (!parsed.columns?.counterparty) {
+    throw new Error('KI-Antwort fehlt: columns.counterparty');
+  }
+  if (!parsed.columns?.amount) {
+    throw new Error('KI-Antwort fehlt: columns.amount');
+  }
+  if (!Array.isArray(parsed.hashFields) || parsed.hashFields.length === 0) {
+    throw new Error('KI-Antwort fehlt: hashFields (Array)');
+  }
+
+  // Ensure csv defaults
+  if (!parsed.csv) {
+    parsed.csv = { delimiter: 'auto', minColumnsPerRow: 5 };
+  }
+  if (!parsed.descriptionTemplate) {
+    parsed.descriptionTemplate = '{type} {purpose}';
+  }
+
+  return parsed as BankTemplateConfig;
 }
 
 export async function suggestCategoryPattern(context: SuggestContext): Promise<SuggestResult> {

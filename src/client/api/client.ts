@@ -1,7 +1,14 @@
 const BASE = '/api';
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(BASE + path, init);
+  const res = await fetch(BASE + path, {
+    ...init,
+    credentials: 'include',
+  });
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('Nicht authentifiziert');
+  }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || res.statusText);

@@ -29,7 +29,8 @@ export function Topbar({ filters, setFilters }: TopbarProps) {
     location.pathname === '/transactions' ? 'Transaktionen' :
     location.pathname === '/import' ? 'Import' :
     location.pathname === '/accounts' ? 'Konten' :
-    location.pathname === '/categories' ? 'Kategorien' : 'Dashboard';
+    location.pathname === '/categories' ? 'Kategorien' :
+    location.pathname === '/templates' ? 'Bank-Templates' : 'Dashboard';
 
   // Derive available years and months from actual data
   const { availableYears, monthsByYear } = useMemo(() => {
@@ -50,8 +51,9 @@ export function Topbar({ filters, setFilters }: TopbarProps) {
     return { availableYears: years, monthsByYear: result };
   }, [monthly]);
 
-  const checkingAccounts = accounts.filter(a => a.account_type !== 'savings');
-  const savingsAccounts = accounts.filter(a => a.account_type === 'savings');
+  const activeAccounts = accounts.filter(a => a.is_active !== false);
+  const checkingAccounts = activeAccounts.filter(a => a.account_type !== 'savings');
+  const savingsAccounts = activeAccounts.filter(a => a.account_type === 'savings');
 
   // Build display label for period
   const periodLabel = useMemo(() => {
@@ -82,7 +84,7 @@ export function Topbar({ filters, setFilters }: TopbarProps) {
           monthsByYear={monthsByYear}
           label={periodLabel}
         />
-        {accounts.length > 0 && (
+        {activeAccounts.length > 0 && (
           <AccountPicker
             filters={filters}
             setFilters={setFilters}

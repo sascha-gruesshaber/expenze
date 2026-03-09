@@ -1,10 +1,11 @@
 import { Link, useLocation } from '@tanstack/react-router';
-import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2, BarChart2 } from 'lucide-react';
+import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2, BarChart2, FileCode2, LogOut } from 'lucide-react';
 import { useSummary } from '../../api/hooks';
 import { fmtDate } from '../../lib/format';
 import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { AiModelSwitcher } from './AiModelSwitcher';
+import { useSession, authClient } from '../../lib/auth';
 
 const navItems = [
   { to: '/dashboard' as const, icon: LayoutDashboard, label: 'Dashboard' },
@@ -13,6 +14,7 @@ const navItems = [
   { to: '/accounts' as const, icon: Landmark, label: 'Konten' },
   { to: '/categories' as const, icon: Tag, label: 'Kategorien' },
   { to: '/import' as const, icon: Upload, label: 'Import' },
+  { to: '/templates' as const, icon: FileCode2, label: 'Bank-Templates' },
 ];
 
 export function Sidebar() {
@@ -22,6 +24,7 @@ export function Sidebar() {
   const queryClient = useQueryClient();
   const [showReset, setShowReset] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const { data: session } = useSession();
 
   async function handleReset() {
     setResetting(true);
@@ -80,7 +83,7 @@ export function Sidebar() {
       <div className="px-3 pb-1">
         <AiModelSwitcher />
       </div>
-      <div className="px-3 pb-4">
+      <div className="px-3 pb-1">
         <button
           onClick={() => setShowReset(true)}
           className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all cursor-pointer w-full text-text-3 hover:text-red-400 hover:bg-red-500/8"
@@ -89,6 +92,18 @@ export function Sidebar() {
           Daten zurücksetzen
         </button>
       </div>
+      {session && (
+        <div className="px-3 py-3 border-t border-border flex items-center justify-between gap-2">
+          <div className="text-[12px] text-text-2 truncate">{session.user.email}</div>
+          <button
+            onClick={() => authClient.signOut().then(() => { window.location.href = '/login'; })}
+            className="text-text-3 hover:text-text transition-colors flex-shrink-0"
+            title="Abmelden"
+          >
+            <LogOut size={15} strokeWidth={1.5} />
+          </button>
+        </div>
+      )}
       {showReset && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
           <div className="bg-surface border border-border rounded-xl p-6 w-[360px] shadow-xl">

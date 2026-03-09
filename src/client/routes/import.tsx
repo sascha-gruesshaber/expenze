@@ -45,11 +45,22 @@ function ImportPage() {
         const fd = new FormData();
         fd.append('files', next.file);
         const data = await apiPost<{ success: boolean; results: ImportResult[] }>('/import', fd);
-        setFileStates(prev =>
-          prev.map(f =>
-            f.id === next.id ? { ...f, status: 'done' as const, result: data.results[0] } : f
-          )
-        );
+        const result = data.results[0];
+        if (result.conflict && result.matchingTemplates) {
+          setFileStates(prev =>
+            prev.map(f =>
+              f.id === next.id
+                ? { ...f, status: 'conflict' as const, matchingTemplates: result.matchingTemplates }
+                : f
+            )
+          );
+        } else {
+          setFileStates(prev =>
+            prev.map(f =>
+              f.id === next.id ? { ...f, status: 'done' as const, result } : f
+            )
+          );
+        }
       } catch (e: any) {
         setFileStates(prev =>
           prev.map(f =>
@@ -83,6 +94,36 @@ function ImportPage() {
     processQueue();
   }, [processQueue]);
 
+  const handleTemplateSelect = useCallback(async (fileId: string, templateId: string) => {
+    const fileState = fileStates.find(f => f.id === fileId);
+    if (!fileState) return;
+
+    setFileStates(prev =>
+      prev.map(f => f.id === fileId ? { ...f, status: 'uploading' as const, matchingTemplates: undefined } : f)
+    );
+
+    try {
+      const fd = new FormData();
+      fd.append('files', fileState.file);
+      fd.append('templateId', templateId);
+      const data = await apiPost<{ success: boolean; results: ImportResult[] }>('/import', fd);
+      setFileStates(prev =>
+        prev.map(f =>
+          f.id === fileId ? { ...f, status: 'done' as const, result: data.results[0] } : f
+        )
+      );
+      invalidateAll();
+    } catch (e: any) {
+      setFileStates(prev =>
+        prev.map(f =>
+          f.id === fileId
+            ? { ...f, status: 'error' as const, error: e.message || 'Unbekannter Fehler' }
+            : f
+        )
+      );
+    }
+  }, [fileStates, invalidateAll]);
+
   const handleClear = useCallback(() => {
     setFileStates([]);
   }, []);
@@ -92,7 +133,7 @@ function ImportPage() {
   return (
     <>
       <DropZone onFiles={handleFiles} compact={hasFiles} />
-      {hasFiles && <ImportQueue files={fileStates} onClear={handleClear} />}
+      {hasFiles && <ImportQueue files={fileStates} onClear={handleClear} onSelectTemplate={handleTemplateSelect} />}
       <div className="bg-surface rounded-2xl shadow-card overflow-hidden mt-6">
         <div className="px-6 py-4 border-b border-border">
           <div className="font-heading font-semibold text-[15px]">Import-Verlauf</div>

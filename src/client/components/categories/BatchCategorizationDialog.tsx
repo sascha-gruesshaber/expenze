@@ -9,6 +9,7 @@ import {
 import { useBatchContext, type RowState } from '../../lib/batchContext';
 import { useFilters } from '../../lib/filterContext';
 import { useToast } from '../layout/Toast';
+import { useConfirmClose, ConfirmCloseBar } from '../../lib/useConfirmClose';
 
 type ConfidenceFilter = 'all' | 'high' | 'medium' | 'low';
 
@@ -42,7 +43,10 @@ export function BatchCategorizationDialog() {
   const isLoading = progress.status === 'loading';
   const canMinimize = progress.status !== 'idle';
 
-  const handleDismiss = useCallback(() => {
+  // Dirty when AI analysis has produced results the user might lose
+  const isDirty = step > 1 || suggestions.length > 0;
+
+  const handleDismissInner = useCallback(() => {
     if (canMinimize && panelRef.current) {
       // Compute offset from dialog center to floating indicator center (bottom-16 right-6)
       const rect = panelRef.current.getBoundingClientRect();
@@ -62,6 +66,9 @@ export function BatchCategorizationDialog() {
       closeDialog();
     }
   }, [canMinimize, closeDialog]);
+
+  const { showConfirm, requestClose, confirmClose, cancelClose } = useConfirmClose(isDirty, handleDismissInner);
+  const handleDismiss = requestClose;
 
   const allCategories = useMemo(() => {
     const set = new Set(categories);
@@ -169,6 +176,9 @@ export function BatchCategorizationDialog() {
         className={`bg-surface rounded-2xl shadow-card-hover border border-border w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col ${isLeaving ? 'animate-dialog-minimize' : ''}`}
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Confirm close banner */}
+        {showConfirm && <ConfirmCloseBar onConfirm={confirmClose} onCancel={cancelClose} />}
+
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
           <div className="flex items-center gap-2">

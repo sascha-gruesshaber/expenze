@@ -4,23 +4,24 @@
   "description": "Personal banking statement analyzer",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev": "prisma generate && prisma db push --skip-generate --accept-data-loss && concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch src/server/server.ts",
     "dev:client": "vite",
     "build": "vite build",
-    "start": "tsx src/server/server.ts",
+    "start": "prisma generate && prisma db push --skip-generate --accept-data-loss && tsx src/server/server.ts",
     "postinstall": "node scripts/postinstall.js",
     "db:push": "prisma db push",
     "db:generate": "prisma generate"
   },
   "dependencies": {
     "@prisma/client": "^6.5.0",
+    "better-auth": "^1.5.4",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "lucide-react": "^0.577.0",
     "multer": "^2.1.1",
-    "pdfjs-dist": "^5.5.207"
+    "nodemailer": "^8.0.2"
   },
   "devDependencies": {
     "@nivo/calendar": "^0.99.0",
@@ -35,6 +36,7 @@
     "@types/express": "^5.0.6",
     "@types/multer": "^2.0.0",
     "@types/node": "^22.0.0",
+    "@types/nodemailer": "^7.0.11",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",

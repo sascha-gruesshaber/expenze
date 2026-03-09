@@ -9,6 +9,7 @@ import {
 } from '../../api/hooks';
 import { useToast } from '../layout/Toast';
 import { fmtDate, fmt } from '../../lib/format';
+import { useConfirmClose, ConfirmCloseBar } from '../../lib/useConfirmClose';
 
 interface RecategorizeDialogProps {
   transaction: Transaction;
@@ -34,6 +35,10 @@ export function RecategorizeDialog({ transaction, open, onClose }: RecategorizeD
   const preview = useRecategorizePreview();
   const suggestPattern = useSuggestPattern();
   const { toast } = useToast();
+
+  // Dirty when user has progressed past step 1 or changed the category
+  const isDirty = step > 1 || (newCategory !== (transaction.category || '') && newCategory.trim() !== '');
+  const { showConfirm, requestClose, confirmClose, cancelClose } = useConfirmClose(isDirty, onClose);
 
   // Reset state when dialog opens
   useEffect(() => {
@@ -108,15 +113,18 @@ export function RecategorizeDialog({ transaction, open, onClose }: RecategorizeD
   const samples = preview.data?.sample_transactions ?? [];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={requestClose}>
       <div
         className="bg-surface rounded-2xl shadow-card-hover border border-border w-full max-w-lg mx-4 max-h-[85vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
+        {/* Confirm close banner */}
+        {showConfirm && <ConfirmCloseBar onConfirm={confirmClose} onCancel={cancelClose} />}
+
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <h3 className="font-heading font-semibold text-[15px] text-text">Kategorie ändern</h3>
-          <button onClick={onClose} className="p-1 rounded-lg hover:bg-surface-2 text-text-3 hover:text-text transition-colors">
+          <button onClick={requestClose} className="p-1 rounded-lg hover:bg-surface-2 text-text-3 hover:text-text transition-colors">
             <X size={18} />
           </button>
         </div>

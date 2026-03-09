@@ -132,8 +132,11 @@ export interface ImportResult {
   filename: string;
   imported: number;
   skipped: number;
+  duplicates: number;
   total: number;
   bank: string;
+  conflict?: boolean;
+  matchingTemplates?: { id: string; name: string }[];
 }
 
 export interface CategoryRule {
@@ -191,6 +194,7 @@ export interface Account {
   account_number: string | null;
   bank: string;
   account_type: string;
+  is_active: boolean;
   created_at: string | null;
   transaction_count: number;
 }
@@ -303,10 +307,28 @@ export function useUpdateCategory() {
 export function useUpdateAccount() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: number; name?: string; account_type?: string; bank?: string }) =>
+    mutationFn: ({ id, ...data }: { id: number; name?: string; account_type?: string; bank?: string; is_active?: boolean }) =>
       apiPatch<Account>(`/accounts/${id}`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['accounts'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['summary'] });
+      qc.invalidateQueries({ queryKey: ['monthly'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
+    },
+  });
+}
+
+export function useDeleteAccount() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => apiDelete<{ success: boolean }>(`/accounts/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['summary'] });
+      qc.invalidateQueries({ queryKey: ['monthly'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
     },
   });
 }
@@ -435,6 +457,68 @@ export function useSuggestPattern() {
   return useMutation({
     mutationFn: (data: { transaction_id: number; category: string }) =>
       apiPost<PatternSuggestion>('/ai/suggest-pattern', data),
+  });
+}
+
+// ── Bank Templates ──────────────────────────────────────────────────
+
+export interface BankTemplate {
+  id: string;
+  name: string;
+  version: number;
+  config: any;
+  is_builtin: boolean;
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export function useBankTemplates() {
+  return useQuery<BankTemplate[]>({
+    queryKey: ['bankTemplates'],
+    queryFn: () => apiFetch('/bank-templates'),
+  });
+}
+
+export function useCreateBankTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { id: string; name: string; config: any }) =>
+      apiPost<BankTemplate>('/bank-templates', data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bankTemplates'] }),
+  });
+}
+
+export function useUpdateBankTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: string; name?: string; config?: any; enabled?: boolean }) =>
+      apiPatch<BankTemplate>(`/bank-templates/${id}`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bankTemplates'] }),
+  });
+}
+
+export function useDeleteBankTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiDelete<{ success: boolean }>(`/bank-templates/${id}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bankTemplates'] }),
+  });
+}
+
+export function useTestBankTemplate() {
+  return useMutation({
+    mutationFn: (data: { config: any; csvText: string; bankName?: string }) =>
+      apiPost<{ transactions: any[]; total: number }>('/bank-templates/test', data),
+  });
+}
+
+// ── AI Template Generation ──────────────────────────────────────────
+
+export function useGenerateTemplate() {
+  return useMutation({
+    mutationFn: (data: { csvSample: string }) =>
+      apiPost<{ config: any }>('/ai/generate-template', data),
   });
 }
 
