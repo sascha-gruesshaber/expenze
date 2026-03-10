@@ -3,6 +3,7 @@ import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { magicLink } from 'better-auth/plugins';
 import { passkey } from '@better-auth/passkey';
 import { prisma } from './prisma.js';
+import { seedDefaultCategoriesForUser } from './seedCategories.js';
 import nodemailer from 'nodemailer';
 
 const smtpConfigured = !!(process.env.SMTP_HOST && process.env.SMTP_USER);
@@ -27,6 +28,15 @@ export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL || 'http://localhost:5173',
   trustedOrigins,
   database: prismaAdapter(prisma, { provider: 'sqlite' }),
+  databaseHooks: {
+    user: {
+      create: {
+        after: async (user) => {
+          await seedDefaultCategoriesForUser(user.id, user.email);
+        },
+      },
+    },
+  },
   emailAndPassword: { enabled: false },
   plugins: [
     magicLink({

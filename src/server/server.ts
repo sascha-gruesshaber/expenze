@@ -7,7 +7,7 @@ import { toNodeHandler } from 'better-auth/node';
 import { auth } from './auth.js';
 import routes from './routes.js';
 import { prisma } from './prisma.js';
-import { DEFAULT_CATEGORIES, DEFAULT_RULES } from './defaultRules.js';
+import { seedDefaultCategoriesForUser } from './seedCategories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -56,80 +56,9 @@ async function migrateOrphanedData() {
       }
     }
 
-    // Clone default categories + rules for users who have none
+    // Seed/backfill default categories + rules for all users
     for (const user of users) {
-      const catCount = await prisma.category.count({ where: { userId: user.id } });
-      if (catCount === 0) {
-        console.log(`  Seeding default categories for ${user.email}...`);
-        for (const cat of DEFAULT_CATEGORIES) {
-          await prisma.category.create({
-            data: { name: cat.name, is_default: true, category_type: cat.type, userId: user.id, created_at: new Date().toISOString() },
-          });
-        }
-        for (let i = 0; i < DEFAULT_RULES.length; i++) {
-          const rule = DEFAULT_RULES[i];
-          await prisma.categoryRule.create({
-            data: {
-              category: rule.category,
-              pattern: rule.pattern,
-              match_field: 'description',
-              match_type: 'regex',
-              priority: (i + 1) * 10,
-              is_default: true,
-              userId: user.id,
-              created_at: new Date().toISOString(),
-            },
-          });
-        }
-      } else {
-        // Backfill new default categories and rules for existing users
-        const existingCats = await prisma.category.findMany({ where: { userId: user.id }, select: { name: true } });
-        const existingNames = new Set(existingCats.map(c => c.name));
-        const newCats = DEFAULT_CATEGORIES.filter(c => !existingNames.has(c.name));
-        if (newCats.length > 0) {
-          console.log(`  Adding ${newCats.length} new default categories for ${user.email}...`);
-          for (const cat of newCats) {
-            await prisma.category.create({
-              data: { name: cat.name, is_default: true, category_type: cat.type, userId: user.id, created_at: new Date().toISOString() },
-            });
-          }
-        }
-
-        // Sync category_type for existing default categories
-        const typeMap = new Map(DEFAULT_CATEGORIES.map(c => [c.name, c.type]));
-        for (const [name, type] of typeMap) {
-          if (type !== 'default') {
-            await prisma.category.updateMany({
-              where: { name, userId: user.id, category_type: 'default' },
-              data: { category_type: type },
-            });
-          }
-        }
-
-        const existingRules = await prisma.categoryRule.findMany({ where: { userId: user.id, is_default: true }, select: { category: true } });
-        const existingRuleCats = new Set(existingRules.map(r => r.category));
-        const newRules = DEFAULT_RULES.filter(r => !existingRuleCats.has(r.category));
-        const maxPriority = await prisma.categoryRule.aggregate({ where: { userId: user.id }, _max: { priority: true } });
-        let nextPriority = (maxPriority._max.priority || 0) + 10;
-        if (newRules.length > 0) {
-          console.log(`  Adding ${newRules.length} new default rules for ${user.email}...`);
-          for (const rule of newRules) {
-            await prisma.categoryRule.create({
-              data: {
-                category: rule.category,
-                pattern: rule.pattern,
-                match_field: 'description',
-                match_type: 'regex',
-                priority: nextPriority,
-                is_default: true,
-                userId: user.id,
-                created_at: new Date().toISOString(),
-              },
-            });
-            nextPriority += 10;
-          }
-        }
-      }
+      await seedDefaultCategoriesForUser(user.id, user.email);
     }
   } catch (e) {
     console.error('Migration error:', e);
