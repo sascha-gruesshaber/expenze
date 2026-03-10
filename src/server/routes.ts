@@ -261,8 +261,8 @@ router.get('/transactions', async (req: Request, res: Response) => {
     const params: any[] = [];
 
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
-    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
-    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+    if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
     if (direction) { sql += ' AND t.direction = ?'; params.push(direction); }
     if (category) { sql += ' AND t.category = ?'; params.push(category); }
     if (search) { sql += ' AND (t.description LIKE ? OR t.counterparty LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
@@ -324,8 +324,8 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
 
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
     sql += excludeTransfersSql(params, userId);
-    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
-    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+    if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
 
     sql += ' GROUP BY t.category ORDER BY total DESC';
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -557,8 +557,8 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
     `;
     const params: any[] = [];
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
-    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
-    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+    if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
     sql += ' GROUP BY t.category';
 
     const txStatsRaw: any[] = await prisma.$queryRawUnsafe(sql, ...params);
@@ -867,8 +867,8 @@ router.post('/ai/batch-groups', async (req: Request, res: Response) => {
        WHERE t.category = 'Sonstiges'`;
     const params: any[] = [];
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
-    if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
-    if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(String(month).padStart(2, '0')); }
+    if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(String(month).padStart(2, '0')); }
     sql += ' ORDER BY t.bu_date DESC';
 
     const sonstige: any[] = await prisma.$queryRawUnsafe(sql, ...params);
@@ -1112,8 +1112,8 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
     const params: any[] = [];
     baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
     baseSql += excludeTransfersSql(params, userId);
-    if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
-    if (month) { baseSql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
+    if (year) { baseSql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (month) { baseSql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
 
     const incomeByIban: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.counterparty_iban as group_key, MIN(t.counterparty) as label, CAST(SUM(t.amount) AS REAL) as total
@@ -1220,7 +1220,7 @@ router.get('/analysis/category-monthly', async (req: Request, res: Response) => 
     const params: any[] = [];
     baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
     baseSql += excludeTransfersSql(params, userId);
-    if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
+    if (year) { baseSql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
 
     const topCats: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total

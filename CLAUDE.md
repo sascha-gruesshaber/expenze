@@ -19,9 +19,13 @@ npx tsc --noEmit --project tsconfig.json           # client
 # Database
 npm run db:push       # apply schema changes
 npm run db:generate   # regenerate Prisma client
+
+# Testing
+npm test              # run all tests (vitest)
+npm run test:watch    # watch mode
 ```
 
-There are no tests or linting configured.
+Tests use Vitest + Supertest. Test files are in `src/server/__tests__/`. Auth is mocked (passthrough with fixed test user). A separate `prisma/test.db` is used. No linting configured.
 
 ## Architecture
 
@@ -65,6 +69,7 @@ Modular parsers for bank statement import:
 - For models with composite `@@unique` (Setting, Category): use `findFirst` with filters, not `findUnique`
 - Raw SQL for transactions must join through bank_accounts: `INNER JOIN bank_accounts a ON t.account_id = a.id AND a.userId = ?`
 - BigInt from raw queries needs serialization to Number for JSON responses
+- In raw SQL, use single quotes for `strftime` format strings: `strftime('%Y', ...)` not `strftime("%Y", ...)` — better-sqlite3 treats double quotes as identifiers
 
 ### Multi-User Data Scoping
 - `userId` column on: `bank_accounts`, `categories`, `category_rules`, `bank_templates`, `settings`, `import_log`
