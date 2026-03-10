@@ -1,5 +1,5 @@
 import { fmt } from '../../lib/format';
-import { CHART_COLORS } from '../../lib/constants';
+import { CHART_COLORS } from '../../lib/nivoTheme';
 import type { CategoryData } from '../../api/hooks';
 
 interface CategoryBreakdownProps {

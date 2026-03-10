@@ -28,7 +28,7 @@ interface FallbackRule {
 
 const STEPS = ['CSV hochladen', 'Grundeinstellungen', 'Spalten-Mapping', 'Beschreibung & Hash', 'Erweitert', 'Testen & Speichern'];
 
-/** Client-side delimiter detection (mirrors csv-utils.ts) */
+/** Client-side delimiter detection (mirrors csvUtils.ts) */
 function detectDelimiter(line: string): ';' | ',' {
   let semi = 0, comma = 0;
   for (const ch of line) {

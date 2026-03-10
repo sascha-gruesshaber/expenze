@@ -5,7 +5,7 @@ import { parseFile, detectTemplates } from './parser.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { categorizeWithRules, computeHash, extractCounterpartyIban, type DbCategoryRule, type BankTemplateConfig } from './parsers/types.js';
 import { ensureBuiltinTemplates, invalidateTemplateCache } from './parsers/registry.js';
-import { parseWithTemplate } from './parsers/template-parser.js';
+import { parseWithTemplate } from './parsers/templateParser.js';
 import { suggestCategoryPattern, categorizeGroup, generateTemplateConfig, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
 import { DEFAULT_RULES, DEFAULT_CATEGORIES } from './defaultRules.js';
 import { requireAuth } from './authMiddleware.js';

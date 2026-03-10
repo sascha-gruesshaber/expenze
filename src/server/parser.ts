@@ -1,5 +1,5 @@
 import { detectParser, detectAllParsers, getParserByTemplateId } from './parsers/registry.js';
-import { decodeBuffer } from './parsers/csv-utils.js';
+import { decodeBuffer } from './parsers/csvUtils.js';
 import type { ParsedTransaction } from './parsers/types.js';
 
 export type { ParsedTransaction };

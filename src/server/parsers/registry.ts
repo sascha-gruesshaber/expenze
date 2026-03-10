@@ -1,9 +1,9 @@
 import { prisma } from '../prisma.js';
 import type { BankParser, BankTemplateConfig } from './types.js';
-import { BUILTIN_TEMPLATES } from './builtin-templates.js';
-import { parseWithTemplate } from './template-parser.js';
-import { parseMT940, detectMT940 } from './mt940-parser.js';
-import { parseCAMT052, detectCAMT052 } from './camt052-parser.js';
+import { BUILTIN_TEMPLATES } from './builtinTemplates.js';
+import { parseWithTemplate } from './templateParser.js';
+import { parseMT940, detectMT940 } from './mt940Parser.js';
+import { parseCAMT052, detectCAMT052 } from './camt052Parser.js';
 
 interface LoadedTemplate {
   id: string;

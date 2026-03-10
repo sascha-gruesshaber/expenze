@@ -1,5 +1,5 @@
 import { prisma } from './prisma.js';
-import { BUILTIN_TEMPLATES } from './parsers/builtin-templates.js';
+import { BUILTIN_TEMPLATES } from './parsers/builtinTemplates.js';
 import type { BankTemplateConfig } from './parsers/types.js';
 
 export const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';

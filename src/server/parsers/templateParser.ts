@@ -1,6 +1,6 @@
 import type { BankTemplateConfig, ColumnMapping, ParsedTransaction } from './types.js';
 import { categorize, computeHash } from './types.js';
-import { detectDelimiter, parseCSVRows, parseCsvDate, parseCsvAmount } from './csv-utils.js';
+import { detectDelimiter, parseCSVRows, parseCsvDate, parseCsvAmount } from './csvUtils.js';
 
 /**
  * Resolve a ColumnMapping to a raw string value from a CSV row.
