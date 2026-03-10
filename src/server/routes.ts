@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import multer from 'multer';
 import { prisma } from './prisma.js';
 import { parseFile, detectTemplates } from './parser.js';
-import { Prisma } from '@prisma/client';
+import { Prisma } from '../generated/prisma/client.js';
 import { categorizeWithRules, computeHash, extractCounterpartyIban, type DbCategoryRule, type BankTemplateConfig } from './parsers/types.js';
 import { ensureBuiltinTemplates, invalidateTemplateCache } from './parsers/registry.js';
 import { parseWithTemplate } from './parsers/template-parser.js';

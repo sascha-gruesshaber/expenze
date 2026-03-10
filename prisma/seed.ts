@@ -1,7 +1,11 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/client.js';
+import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
 import { DEFAULT_RULES, DEFAULT_CATEGORIES } from '../src/server/defaultRules.js';
 
-const prisma = new PrismaClient();
+const adapter = new PrismaBetterSqlite3({
+  url: process.env.DATABASE_URL || 'file:./prisma/dev.db',
+});
+const prisma = new PrismaClient({ adapter });
 
 // Old → New category name mapping for data migration
 const CATEGORY_RENAMES: Record<string, string> = {
