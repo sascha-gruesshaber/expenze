@@ -1,9 +1,10 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useSummary } from '../api/hooks';
 import { apiPost } from '../api/client';
 import type { ImportResult } from '../api/hooks';
+import { fetchImportStatus } from '../api/hooks';
 import { DropZone } from '../components/import/DropZone';
 import { ImportQueue } from '../components/import/ImportQueue';
 import type { FileImportState } from '../components/import/ImportQueue';
@@ -19,6 +20,17 @@ function ImportPage() {
   const [fileStates, setFileStates] = useState<FileImportState[]>([]);
   const processingRef = useRef(false);
   const queueRef = useRef<FileImportState[]>([]);
+  const pollIntervalsRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+
+  // Cleanup polling intervals on unmount
+  useEffect(() => {
+    return () => {
+      for (const interval of pollIntervalsRef.current.values()) {
+        clearInterval(interval);
+      }
+      pollIntervalsRef.current.clear();
+    };
+  }, []);
 
   const invalidateAll = useCallback(() => {
     qc.invalidateQueries({ queryKey: ['summary'] });
@@ -28,6 +40,65 @@ function ImportPage() {
     qc.invalidateQueries({ queryKey: ['categoryList'] });
     qc.invalidateQueries({ queryKey: ['accounts'] });
   }, [qc]);
+
+  const startPolling = useCallback((fileId: string, importId: string) => {
+    // Avoid duplicate intervals
+    if (pollIntervalsRef.current.has(fileId)) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const status = await fetchImportStatus(importId);
+        setFileStates(prev =>
+          prev.map(f => {
+            if (f.id !== fileId) return f;
+            if (status.status === 'done') {
+              return {
+                ...f,
+                status: 'done' as const,
+                progress: undefined,
+                result: {
+                  filename: status.filename,
+                  imported: status.imported,
+                  skipped: status.skipped + status.duplicates,
+                  total: status.total,
+                  bank: status.bank,
+                },
+              };
+            }
+            if (status.status === 'error') {
+              return {
+                ...f,
+                status: 'error' as const,
+                progress: undefined,
+                error: status.error || 'Unbekannter Fehler',
+              };
+            }
+            // Still processing — update progress
+            return {
+              ...f,
+              progress: {
+                processed: status.processed,
+                total: status.total,
+                imported: status.imported,
+                skipped: status.skipped,
+                duplicates: status.duplicates,
+              },
+            };
+          })
+        );
+
+        if (status.status === 'done' || status.status === 'error') {
+          clearInterval(interval);
+          pollIntervalsRef.current.delete(fileId);
+          invalidateAll();
+        }
+      } catch {
+        // Network error — keep polling, will retry next interval
+      }
+    }, 1000);
+
+    pollIntervalsRef.current.set(fileId, interval);
+  }, [invalidateAll]);
 
   const processQueue = useCallback(async () => {
     if (processingRef.current) return;
@@ -54,12 +125,16 @@ function ImportPage() {
                 : f
             )
           );
-        } else {
+        } else if (result.importId) {
+          // Background processing — switch to polling
           setFileStates(prev =>
             prev.map(f =>
-              f.id === next.id ? { ...f, status: 'done' as const, result } : f
+              f.id === next.id
+                ? { ...f, status: 'processing' as const, importId: result.importId, progress: { processed: 0, total: result.total, imported: 0, skipped: 0, duplicates: 0 } }
+                : f
             )
           );
+          startPolling(next.id, result.importId);
         }
       } catch (e: any) {
         setFileStates(prev =>
@@ -73,13 +148,12 @@ function ImportPage() {
     }
 
     processingRef.current = false;
-    invalidateAll();
 
     // If new items were added while finishing up, restart
     if (queueRef.current.length > 0) {
       processQueue();
     }
-  }, [invalidateAll]);
+  }, [startPolling]);
 
   const handleFiles = useCallback((files: FileList) => {
     const newStates: FileImportState[] = Array.from(files).map(file => ({
@@ -107,12 +181,18 @@ function ImportPage() {
       fd.append('files', fileState.file);
       fd.append('templateId', templateId);
       const data = await apiPost<{ success: boolean; results: ImportResult[] }>('/import', fd);
-      setFileStates(prev =>
-        prev.map(f =>
-          f.id === fileId ? { ...f, status: 'done' as const, result: data.results[0] } : f
-        )
-      );
-      invalidateAll();
+      const result = data.results[0];
+
+      if (result.importId) {
+        setFileStates(prev =>
+          prev.map(f =>
+            f.id === fileId
+              ? { ...f, status: 'processing' as const, importId: result.importId, progress: { processed: 0, total: result.total, imported: 0, skipped: 0, duplicates: 0 } }
+              : f
+          )
+        );
+        startPolling(fileId, result.importId);
+      }
     } catch (e: any) {
       setFileStates(prev =>
         prev.map(f =>
@@ -122,9 +202,14 @@ function ImportPage() {
         )
       );
     }
-  }, [fileStates, invalidateAll]);
+  }, [fileStates, startPolling]);
 
   const handleClear = useCallback(() => {
+    // Stop any active polling
+    for (const interval of pollIntervalsRef.current.values()) {
+      clearInterval(interval);
+    }
+    pollIntervalsRef.current.clear();
     setFileStates([]);
   }, []);
 

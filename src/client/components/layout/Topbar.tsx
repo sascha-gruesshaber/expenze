@@ -26,6 +26,7 @@ export function Topbar({ filters, setFilters }: TopbarProps) {
 
   const title =
     location.pathname === '/analytics' ? 'Finanzanalyse' :
+    location.pathname === '/chat' ? 'KI-Assistent' :
     location.pathname === '/transactions' ? 'Transaktionen' :
     location.pathname === '/import' ? 'Import' :
     location.pathname === '/accounts' ? 'Konten' :

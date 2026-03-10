@@ -1,5 +1,5 @@
 import { Link, useLocation } from '@tanstack/react-router';
-import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2, BarChart2, FileCode2, LogOut } from 'lucide-react';
+import { LayoutDashboard, ArrowLeftRight, Upload, Landmark, Tag, Trash2, BarChart2, FileCode2, LogOut, MessageCircle, Settings } from 'lucide-react';
 import { useSummary } from '../../api/hooks';
 import { fmtDate } from '../../lib/format';
 import { useQueryClient } from '@tanstack/react-query';
@@ -10,11 +10,13 @@ import { useSession, authClient } from '../../lib/auth';
 const navItems = [
   { to: '/dashboard' as const, icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/analytics' as const, icon: BarChart2, label: 'Analyse' },
+  { to: '/chat' as const, icon: MessageCircle, label: 'KI-Assistent' },
   { to: '/transactions' as const, icon: ArrowLeftRight, label: 'Transaktionen' },
   { to: '/accounts' as const, icon: Landmark, label: 'Konten' },
   { to: '/categories' as const, icon: Tag, label: 'Kategorien' },
   { to: '/import' as const, icon: Upload, label: 'Import' },
   { to: '/templates' as const, icon: FileCode2, label: 'Bank-Templates' },
+  { to: '/settings' as const, icon: Settings, label: 'Einstellungen' },
 ];
 
 export function Sidebar() {

@@ -1,6 +1,7 @@
 import { betterAuth } from 'better-auth';
 import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { magicLink } from 'better-auth/plugins';
+import { passkey } from '@better-auth/passkey';
 import { prisma } from './prisma.js';
 import nodemailer from 'nodemailer';
 
@@ -37,6 +38,9 @@ export const auth = betterAuth({
           console.log(`\n  Magic Link for ${email}:\n  ${url}\n`);
         }
       },
+    }),
+    passkey({
+      rpName: 'expenze',
     }),
   ],
 });

@@ -9,11 +9,14 @@ import { parseWithTemplate } from './parsers/template-parser.js';
 import { suggestCategoryPattern, categorizeGroup, generateTemplateConfig, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
 import { DEFAULT_RULES, DEFAULT_CATEGORIES } from './defaultRules.js';
 import { requireAuth } from './authMiddleware.js';
+import { chatRouter } from './chat.js';
+import { createJob, getJob, processImportInBackground } from './importManager.js';
 
 const router = Router();
 
 // All API routes require authentication
 router.use(requireAuth);
+router.use(chatRouter);
 
 function getUserId(req: Request): string {
   return (req as any).userId;
@@ -157,7 +160,7 @@ async function findOrCreateAccount(tx: { iban: string | null; account_number: st
   return account.id;
 }
 
-// Import CSV
+// Import CSV — non-blocking with progress tracking
 router.post('/import', upload.array('files'), async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
@@ -179,7 +182,6 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
       }
 
       const { transactions, detectedBank } = await parseFile(file.buffer, file.originalname, templateId);
-      let imported = 0, skipped = 0, duplicates = 0;
 
       // Pre-compute dedup keys and batch-check for existing duplicates (user-scoped)
       const dedupKeys = transactions.map(tx => computeDedupKey(tx));
@@ -199,79 +201,11 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
         }
       }
 
-      // Per-row account resolution
-      const accountCache = new Map<string, number>();
+      // Create background job and respond immediately
+      const importId = createJob(file.originalname, transactions.length, detectedBank);
+      processImportInBackground(importId, transactions, existingDedupKeys, dedupKeys, dbRules, userId);
 
-      for (let idx = 0; idx < transactions.length; idx++) {
-        const tx = transactions[idx];
-        const dedupKey = dedupKeys[idx];
-
-        if (dedupKey && existingDedupKeys.has(dedupKey)) {
-          duplicates++;
-          continue;
-        }
-
-        // Resolve account for this transaction (user-scoped)
-        const accountKey = tx.iban || tx.account_number || '';
-        let accountId: number | null = null;
-        if (accountKey) {
-          if (accountCache.has(accountKey)) {
-            accountId = accountCache.get(accountKey)!;
-          } else {
-            accountId = await findOrCreateAccount(tx, userId);
-            accountCache.set(accountKey, accountId);
-          }
-        }
-
-        const category = categorizeWithRules(tx.description || '', tx.counterparty || '', dbRules);
-        try {
-          await prisma.transaction.create({
-            data: {
-              account_number: tx.account_number,
-              bu_date: tx.bu_date,
-              value_date: tx.value_date,
-              type: tx.type,
-              description: tx.description,
-              counterparty: tx.counterparty,
-              counterparty_iban: tx.counterparty_iban,
-              counterparty_bic: tx.counterparty_bic,
-              purpose: tx.purpose,
-              currency: tx.currency,
-              balance_after: tx.balance_after,
-              creditor_id: tx.creditor_id,
-              mandate_reference: tx.mandate_reference,
-              original_category: tx.original_category,
-              amount: tx.amount,
-              direction: tx.direction,
-              category: category,
-              source_file: tx.source_file,
-              hash: tx.hash,
-              dedup_key: dedupKey,
-              account_id: accountId,
-            },
-          });
-          imported++;
-          if (dedupKey) existingDedupKeys.add(dedupKey);
-        } catch (e: any) {
-          if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-            skipped++;
-          } else {
-            throw e;
-          }
-        }
-      }
-
-      await prisma.importLog.create({
-        data: {
-          filename: file.originalname,
-          imported_at: new Date().toISOString(),
-          records_imported: imported,
-          records_skipped: skipped,
-          userId,
-        },
-      });
-
-      results.push({ filename: file.originalname, imported, skipped, duplicates: duplicates + skipped, total: transactions.length, bank: detectedBank });
+      results.push({ filename: file.originalname, importId, total: transactions.length, bank: detectedBank });
     }
 
     res.json({ success: true, results });
@@ -279,6 +213,17 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
     console.error(err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Import progress polling
+router.get('/import/:id/status', (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const job = getJob(id);
+  if (!job) {
+    res.status(404).json({ error: 'Import not found' });
+    return;
+  }
+  res.json(job);
 });
 
 // Helper: build account filter SQL clause (user-scoped)

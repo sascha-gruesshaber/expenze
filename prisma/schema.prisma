@@ -20,6 +20,7 @@ model User {
 
   sessions      Session[]
   accounts      Account[]
+  passkeys      Passkey[]
   bankAccounts  BankAccount[]
   categories    Category[]
   categoryRules CategoryRule[]
@@ -74,6 +75,22 @@ model Verification {
   @@map("verification")
 }
 
+model Passkey {
+  id           String    @id
+  name         String?
+  publicKey    String
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  credentialID String
+  counter      Int
+  deviceType   String
+  backedUp     Boolean
+  transports   String?
+  createdAt    DateTime  @default(now())
+
+  @@map("passkey")
+}
+
 // ── App Models ──────────────────────────────────────────────────────
 
 model BankAccount {
@@ -115,11 +132,12 @@ model Transaction {
   creditor_id         String?
   mandate_reference   String?
   original_category   String?
-  hash                String?      @unique(map: "sqlite_autoindex_transactions_1")
+  hash                String?
   dedup_key           String?
   account_id          Int?
   account             BankAccount? @relation(fields: [account_id], references: [id])
 
+  @@unique([hash, account_id], map: "sqlite_autoindex_transactions_1")
   @@index([dedup_key], map: "idx_transactions_dedup_key")
   @@map("transactions")
 }

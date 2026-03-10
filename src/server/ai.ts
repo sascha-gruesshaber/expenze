@@ -2,8 +2,8 @@ import { prisma } from './prisma.js';
 import { BUILTIN_TEMPLATES } from './parsers/builtin-templates.js';
 import type { BankTemplateConfig } from './parsers/types.js';
 
-const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
-const DEFAULT_MODEL = 'google/gemini-3.1-flash-lite-preview';
+export const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+export const DEFAULT_MODEL = 'google/gemini-3.1-flash-lite-preview';
 
 export const PRESET_MODELS = [
   { id: 'google/gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Flash Lite' },
@@ -148,6 +148,11 @@ export async function fetchAllModels(): Promise<{ models: BrowseModel[]; provide
 
 async function getModel(): Promise<string> {
   const setting = await prisma.setting.findFirst({ where: { key: 'ai_model' } });
+  return setting?.value || DEFAULT_MODEL;
+}
+
+export async function getModelForUser(userId: string): Promise<string> {
+  const setting = await prisma.setting.findFirst({ where: { key: 'ai_model', userId } });
   return setting?.value || DEFAULT_MODEL;
 }
 

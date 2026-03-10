@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { authClient, useSession } from '../lib/auth';
+import { Fingerprint } from 'lucide-react';
 
 export const Route = createFileRoute('/login')({
   component: LoginPage,
@@ -11,6 +12,7 @@ function LoginPage() {
   const [sent, setSent] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [passkeyLoading, setPasskeyLoading] = useState(false);
   const { data: session } = useSession();
   const navigate = useNavigate();
 
@@ -38,6 +40,27 @@ function LoginPage() {
       setError('Verbindung zum Server fehlgeschlagen');
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handlePasskeySignIn() {
+    setError('');
+    setPasskeyLoading(true);
+    try {
+      const { error: authError } = await authClient.signIn.passkey({
+        fetchOptions: {
+          onSuccess() {
+            navigate({ to: '/dashboard' });
+          },
+        },
+      });
+      if (authError) {
+        setError(authError.message || 'Passkey-Anmeldung fehlgeschlagen');
+      }
+    } catch {
+      setError('Passkey-Anmeldung fehlgeschlagen');
+    } finally {
+      setPasskeyLoading(false);
     }
   }
 
@@ -82,6 +105,7 @@ function LoginPage() {
                   value={email}
                   onChange={e => setEmail(e.target.value)}
                   placeholder="name@beispiel.de"
+                  autoComplete="username webauthn"
                   className="w-full px-3 py-2.5 bg-surface-2 border border-border rounded-lg text-[13px] text-text placeholder:text-text-3 focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent transition-all"
                   autoFocus
                 />
@@ -96,6 +120,24 @@ function LoginPage() {
                   {loading ? 'Wird gesendet...' : 'Magic Link senden'}
                 </button>
               </form>
+
+              <div className="relative my-5">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-border" />
+                </div>
+                <div className="relative flex justify-center text-[11px]">
+                  <span className="bg-surface px-3 text-text-3">oder</span>
+                </div>
+              </div>
+
+              <button
+                onClick={handlePasskeySignIn}
+                disabled={passkeyLoading}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-surface-2 border border-border text-text text-[13px] font-medium rounded-lg hover:bg-surface-3 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Fingerprint size={16} />
+                {passkeyLoading ? 'Warte auf Passkey...' : 'Mit Passkey anmelden'}
+              </button>
             </>
           )}
         </div>

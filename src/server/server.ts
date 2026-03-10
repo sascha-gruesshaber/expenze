@@ -81,6 +81,43 @@ async function migrateOrphanedData() {
             },
           });
         }
+      } else {
+        // Backfill new default categories and rules for existing users
+        const existingCats = await prisma.category.findMany({ where: { userId: user.id }, select: { name: true } });
+        const existingNames = new Set(existingCats.map(c => c.name));
+        const newCats = DEFAULT_CATEGORIES.filter(c => !existingNames.has(c.name));
+        if (newCats.length > 0) {
+          console.log(`  Adding ${newCats.length} new default categories for ${user.email}...`);
+          for (const cat of newCats) {
+            await prisma.category.create({
+              data: { name: cat.name, is_default: true, category_type: cat.type, userId: user.id, created_at: new Date().toISOString() },
+            });
+          }
+        }
+
+        const existingRules = await prisma.categoryRule.findMany({ where: { userId: user.id, is_default: true }, select: { category: true } });
+        const existingRuleCats = new Set(existingRules.map(r => r.category));
+        const newRules = DEFAULT_RULES.filter(r => !existingRuleCats.has(r.category));
+        const maxPriority = await prisma.categoryRule.aggregate({ where: { userId: user.id }, _max: { priority: true } });
+        let nextPriority = (maxPriority._max.priority || 0) + 10;
+        if (newRules.length > 0) {
+          console.log(`  Adding ${newRules.length} new default rules for ${user.email}...`);
+          for (const rule of newRules) {
+            await prisma.categoryRule.create({
+              data: {
+                category: rule.category,
+                pattern: rule.pattern,
+                match_field: 'description',
+                match_type: 'regex',
+                priority: nextPriority,
+                is_default: true,
+                userId: user.id,
+                created_at: new Date().toISOString(),
+              },
+            });
+            nextPriority += 10;
+          }
+        }
       }
     }
   } catch (e) {

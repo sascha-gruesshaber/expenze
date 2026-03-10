@@ -130,13 +130,31 @@ export interface ImportLogEntry {
 
 export interface ImportResult {
   filename: string;
+  imported?: number;
+  skipped?: number;
+  duplicates?: number;
+  total: number;
+  bank: string;
+  importId?: string;
+  conflict?: boolean;
+  matchingTemplates?: { id: string; name: string }[];
+}
+
+export interface ImportProgressResponse {
+  id: string;
+  status: 'parsing' | 'processing' | 'done' | 'error';
+  filename: string;
+  total: number;
+  processed: number;
   imported: number;
   skipped: number;
   duplicates: number;
-  total: number;
+  error?: string;
   bank: string;
-  conflict?: boolean;
-  matchingTemplates?: { id: string; name: string }[];
+}
+
+export function fetchImportStatus(importId: string): Promise<ImportProgressResponse> {
+  return apiFetch<ImportProgressResponse>(`/import/${importId}/status`);
 }
 
 export interface CategoryRule {

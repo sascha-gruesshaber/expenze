@@ -1,11 +1,13 @@
 import { CheckCircle2, XCircle, Loader2, RotateCcw, AlertTriangle } from 'lucide-react';
 
-export type FileStatus = 'queued' | 'uploading' | 'done' | 'error' | 'conflict';
+export type FileStatus = 'queued' | 'uploading' | 'processing' | 'done' | 'error' | 'conflict';
 
 export interface FileImportState {
   id: string;
   file: File;
   status: FileStatus;
+  importId?: string;
+  progress?: { processed: number; total: number; imported: number; skipped: number; duplicates: number };
   result?: { filename: string; imported: number; skipped: number; total: number; bank: string };
   error?: string;
   matchingTemplates?: { id: string; name: string }[];
@@ -27,8 +29,9 @@ export function ImportQueue({ files, onClear, onSelectTemplate }: ImportQueuePro
   const done = files.filter(f => f.status === 'done').length;
   const errors = files.filter(f => f.status === 'error').length;
   const conflicts = files.filter(f => f.status === 'conflict').length;
+  const processing = files.filter(f => f.status === 'processing').length;
   const total = files.length;
-  const allDone = done + errors === total && conflicts === 0;
+  const allDone = done + errors === total && conflicts === 0 && processing === 0;
   const progress = total > 0 ? ((done + errors) / total) * 100 : 0;
 
   const totalImported = files.reduce((sum, f) => sum + (f.result?.imported || 0), 0);
@@ -102,7 +105,7 @@ function FileCard({ file, index, onSelectTemplate }: { file: FileImportState; in
           {file.status === 'queued' && (
             <div className="w-3 h-3 rounded-full border-2 border-border-2" />
           )}
-          {file.status === 'uploading' && (
+          {(file.status === 'uploading' || file.status === 'processing') && (
             <Loader2 size={18} className="text-accent animate-spin" />
           )}
           {file.status === 'done' && (
@@ -132,7 +135,11 @@ function FileCard({ file, index, onSelectTemplate }: { file: FileImportState; in
           </div>
           <div className="text-[11px] text-text-3 mt-0.5">
             {file.status === 'queued' && 'Warte...'}
-            {file.status === 'uploading' && 'Verarbeite...'}
+            {file.status === 'uploading' && 'Hochladen...'}
+            {file.status === 'processing' && file.progress && (
+              <>Verarbeite {file.progress.processed}/{file.progress.total} Transaktionen...</>
+            )}
+            {file.status === 'processing' && !file.progress && 'Verarbeite...'}
             {file.status === 'done' && file.result && (
               <>{file.result.imported} importiert · {file.result.skipped} übersprungen · {file.result.total} gesamt</>
             )}
@@ -150,6 +157,18 @@ function FileCard({ file, index, onSelectTemplate }: { file: FileImportState; in
           {formatFileSize(file.file.size)}
         </div>
       </div>
+
+      {/* Processing progress bar */}
+      {file.status === 'processing' && file.progress && file.progress.total > 0 && (
+        <div className="ml-8 mt-2">
+          <div className="h-1 bg-surface-2 rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full bg-accent transition-all duration-300 ease-out"
+              style={{ width: `${(file.progress.processed / file.progress.total) * 100}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Template picker for conflicts */}
       {file.status === 'conflict' && file.matchingTemplates && (

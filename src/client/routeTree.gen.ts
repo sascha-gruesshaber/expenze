@@ -11,9 +11,11 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as TransactionsRouteImport } from './routes/transactions'
 import { Route as TemplatesRouteImport } from './routes/templates'
+import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as ImportRouteImport } from './routes/import'
 import { Route as DashboardRouteImport } from './routes/dashboard'
+import { Route as ChatRouteImport } from './routes/chat'
 import { Route as CategoriesRouteImport } from './routes/categories'
 import { Route as AnalyticsRouteImport } from './routes/analytics'
 import { Route as AccountsRouteImport } from './routes/accounts'
@@ -29,6 +31,11 @@ const TemplatesRoute = TemplatesRouteImport.update({
   path: '/templates',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -42,6 +49,11 @@ const ImportRoute = ImportRouteImport.update({
 const DashboardRoute = DashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ChatRoute = ChatRouteImport.update({
+  id: '/chat',
+  path: '/chat',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CategoriesRoute = CategoriesRouteImport.update({
@@ -70,9 +82,11 @@ export interface FileRoutesByFullPath {
   '/accounts': typeof AccountsRoute
   '/analytics': typeof AnalyticsRoute
   '/categories': typeof CategoriesRoute
+  '/chat': typeof ChatRoute
   '/dashboard': typeof DashboardRoute
   '/import': typeof ImportRoute
   '/login': typeof LoginRoute
+  '/settings': typeof SettingsRoute
   '/templates': typeof TemplatesRoute
   '/transactions': typeof TransactionsRoute
 }
@@ -81,9 +95,11 @@ export interface FileRoutesByTo {
   '/accounts': typeof AccountsRoute
   '/analytics': typeof AnalyticsRoute
   '/categories': typeof CategoriesRoute
+  '/chat': typeof ChatRoute
   '/dashboard': typeof DashboardRoute
   '/import': typeof ImportRoute
   '/login': typeof LoginRoute
+  '/settings': typeof SettingsRoute
   '/templates': typeof TemplatesRoute
   '/transactions': typeof TransactionsRoute
 }
@@ -93,9 +109,11 @@ export interface FileRoutesById {
   '/accounts': typeof AccountsRoute
   '/analytics': typeof AnalyticsRoute
   '/categories': typeof CategoriesRoute
+  '/chat': typeof ChatRoute
   '/dashboard': typeof DashboardRoute
   '/import': typeof ImportRoute
   '/login': typeof LoginRoute
+  '/settings': typeof SettingsRoute
   '/templates': typeof TemplatesRoute
   '/transactions': typeof TransactionsRoute
 }
@@ -106,9 +124,11 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/analytics'
     | '/categories'
+    | '/chat'
     | '/dashboard'
     | '/import'
     | '/login'
+    | '/settings'
     | '/templates'
     | '/transactions'
   fileRoutesByTo: FileRoutesByTo
@@ -117,9 +137,11 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/analytics'
     | '/categories'
+    | '/chat'
     | '/dashboard'
     | '/import'
     | '/login'
+    | '/settings'
     | '/templates'
     | '/transactions'
   id:
@@ -128,9 +150,11 @@ export interface FileRouteTypes {
     | '/accounts'
     | '/analytics'
     | '/categories'
+    | '/chat'
     | '/dashboard'
     | '/import'
     | '/login'
+    | '/settings'
     | '/templates'
     | '/transactions'
   fileRoutesById: FileRoutesById
@@ -140,9 +164,11 @@ export interface RootRouteChildren {
   AccountsRoute: typeof AccountsRoute
   AnalyticsRoute: typeof AnalyticsRoute
   CategoriesRoute: typeof CategoriesRoute
+  ChatRoute: typeof ChatRoute
   DashboardRoute: typeof DashboardRoute
   ImportRoute: typeof ImportRoute
   LoginRoute: typeof LoginRoute
+  SettingsRoute: typeof SettingsRoute
   TemplatesRoute: typeof TemplatesRoute
   TransactionsRoute: typeof TransactionsRoute
 }
@@ -161,6 +187,13 @@ declare module '@tanstack/react-router' {
       path: '/templates'
       fullPath: '/templates'
       preLoaderRoute: typeof TemplatesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -182,6 +215,13 @@ declare module '@tanstack/react-router' {
       path: '/dashboard'
       fullPath: '/dashboard'
       preLoaderRoute: typeof DashboardRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/chat': {
+      id: '/chat'
+      path: '/chat'
+      fullPath: '/chat'
+      preLoaderRoute: typeof ChatRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/categories': {
@@ -220,9 +260,11 @@ const rootRouteChildren: RootRouteChildren = {
   AccountsRoute: AccountsRoute,
   AnalyticsRoute: AnalyticsRoute,
   CategoriesRoute: CategoriesRoute,
+  ChatRoute: ChatRoute,
   DashboardRoute: DashboardRoute,
   ImportRoute: ImportRoute,
   LoginRoute: LoginRoute,
+  SettingsRoute: SettingsRoute,
   TemplatesRoute: TemplatesRoute,
   TransactionsRoute: TransactionsRoute,
 }
