@@ -226,6 +226,12 @@ router.get('/import/:id/status', (req: Request, res: Response) => {
   res.json(job);
 });
 
+// Helper: exclude transfer categories (Umbuchungen) from analysis queries
+function excludeTransfersSql(params: any[], userId: string): string {
+  params.push(userId);
+  return ` AND COALESCE(t.category, '') NOT IN (SELECT name FROM categories WHERE category_type = 'transfer' AND userId = ?)`;
+}
+
 // Helper: build account filter SQL clause (user-scoped)
 // Requires the main query to use INNER JOIN bank_accounts a ON t.account_id = a.id
 function accountFilterSql(params: any[], query: Record<string, string>, userId: string): string {
@@ -288,6 +294,7 @@ router.get('/analysis/monthly', async (req: Request, res: Response) => {
     `;
     const params: any[] = [];
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += excludeTransfersSql(params, userId);
     sql += ' GROUP BY month ORDER BY month ASC';
 
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -316,6 +323,7 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
     const params: any[] = [userId, direction];
 
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += excludeTransfersSql(params, userId);
     if (year) { sql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { sql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
 
@@ -345,6 +353,7 @@ router.get('/analysis/summary', async (req: Request, res: Response) => {
     `;
     const params: any[] = [];
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += excludeTransfersSql(params, userId);
 
     const totals: any[] = await prisma.$queryRawUnsafe(sql, ...params);
     const importLog = await prisma.importLog.findMany({
@@ -577,9 +586,10 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
     }));
 
     result.sort((a, b) => {
+      // Used categories first, then unused
       if (a.tx_count > 0 && b.tx_count === 0) return -1;
       if (a.tx_count === 0 && b.tx_count > 0) return 1;
-      if (a.tx_count > 0 && b.tx_count > 0) return b.tx_count - a.tx_count;
+      // Within each group, sort by name
       return a.category.localeCompare(b.category, 'de');
     });
 
@@ -624,7 +634,7 @@ router.patch('/categories/:id', async (req: Request, res: Response) => {
 
     const data: any = {};
 
-    if (category_type !== undefined && ['default', 'savings'].includes(category_type)) {
+    if (category_type !== undefined && ['default', 'savings', 'transfer'].includes(category_type)) {
       data.category_type = category_type;
     }
 
@@ -1101,6 +1111,7 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
     let baseSql = ' WHERE 1=1';
     const params: any[] = [];
     baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
+    baseSql += excludeTransfersSql(params, userId);
     if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
     if (month) { baseSql += ' AND strftime("%m", t.bu_date) = ?'; params.push(month.padStart(2, '0')); }
 
@@ -1189,6 +1200,7 @@ router.get('/analysis/daily', async (req: Request, res: Response) => {
     `;
     const params: any[] = [targetYear];
     sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += excludeTransfersSql(params, userId);
     sql += ' GROUP BY t.bu_date ORDER BY t.bu_date ASC';
 
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -1207,6 +1219,7 @@ router.get('/analysis/category-monthly', async (req: Request, res: Response) => 
     let baseSql = ' WHERE t.direction = \'debit\'';
     const params: any[] = [];
     baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
+    baseSql += excludeTransfersSql(params, userId);
     if (year) { baseSql += ' AND strftime("%Y", t.bu_date) = ?'; params.push(year); }
 
     const topCats: any[] = await prisma.$queryRawUnsafe(

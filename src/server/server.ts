@@ -95,6 +95,17 @@ async function migrateOrphanedData() {
           }
         }
 
+        // Sync category_type for existing default categories
+        const typeMap = new Map(DEFAULT_CATEGORIES.map(c => [c.name, c.type]));
+        for (const [name, type] of typeMap) {
+          if (type !== 'default') {
+            await prisma.category.updateMany({
+              where: { name, userId: user.id, category_type: 'default' },
+              data: { category_type: type },
+            });
+          }
+        }
+
         const existingRules = await prisma.categoryRule.findMany({ where: { userId: user.id, is_default: true }, select: { category: true } });
         const existingRuleCats = new Set(existingRules.map(r => r.category));
         const newRules = DEFAULT_RULES.filter(r => !existingRuleCats.has(r.category));

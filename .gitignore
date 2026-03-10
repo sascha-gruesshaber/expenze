@@ -9,3 +9,4 @@ data
 .tanstack
 *local*
 .env
+.inputs

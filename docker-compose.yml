@@ -1,0 +1,14 @@
+services:
+  expenze:
+    image: ghcr.io/sascha-gruesshaber/expenze:latest
+    container_name: expenze
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - expenze-data:/app/data
+    env_file:
+      - .env
+
+volumes:
+  expenze-data:

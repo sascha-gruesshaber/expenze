@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { ChevronDown, ChevronRight, Plus, Pencil, Trash2, Check, X, PiggyBank } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { ChevronDown, ChevronRight, Plus, Pencil, Trash2, Check, X, PiggyBank, Archive, ArrowLeftRight, Tag } from 'lucide-react';
 import { useCategoryOverview, useCategoryRules, useCreateCategoryRule, useUpdateCategoryMeta, type CategoryOverview } from '../../api/hooks';
 import { fmt } from '../../lib/format';
 import { useToast } from '../layout/Toast';
@@ -7,6 +7,19 @@ import { RuleList } from './RuleList';
 import { RuleForm } from './RuleForm';
 import { DeleteCategoryDialog } from './DeleteCategoryDialog';
 import type { FilterState } from '../../lib/filterContext';
+
+const CATEGORY_TYPES = [
+  { value: 'default', label: 'Standard', icon: null, color: 'text-text-3' },
+  { value: 'savings', label: 'Sparen', icon: PiggyBank, color: 'text-accent' },
+  { value: 'transfer', label: 'Umbuchung', icon: ArrowLeftRight, color: 'text-blue-400' },
+] as const;
+
+const TYPE_LABELS: Record<string, string> = {
+  default: 'Typ: Standard',
+  savings: 'Als Spar-Kategorie markiert',
+  transfer: 'Als Umbuchung markiert — wird in Analysen ignoriert',
+  fallback: 'Standard-Auffangkategorie',
+};
 
 interface Props {
   filters?: FilterState;
@@ -23,6 +36,18 @@ export function CategoryOverviewTable({ filters }: Props) {
   const [renamingId, setRenamingId] = useState<number | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [deleteTarget, setDeleteTarget] = useState<CategoryOverview | null>(null);
+  const [typeMenuFor, setTypeMenuFor] = useState<number | null>(null);
+  const typeMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (typeMenuRef.current && !typeMenuRef.current.contains(e.target as Node)) {
+        setTypeMenuFor(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   const toggle = (cat: string) => {
     setExpanded(expanded === cat ? null : cat);
@@ -50,13 +75,12 @@ export function CategoryOverviewTable({ filters }: Props) {
     );
   };
 
-  const toggleSavings = (cat: CategoryOverview, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const newType = cat.category_type === 'savings' ? 'default' : 'savings';
+  const setCategoryType = (cat: CategoryOverview, newType: string) => {
+    if (cat.category_type === newType) { setTypeMenuFor(null); return; }
     updateCategory.mutate(
       { id: cat.category_id, category_type: newType },
       {
-        onSuccess: () => toast(newType === 'savings' ? 'Als Spar-Kategorie markiert' : 'Spar-Markierung entfernt'),
+        onSuccess: () => { toast(TYPE_LABELS[newType] || 'Typ geändert'); setTypeMenuFor(null); },
         onError: (err) => toast('Fehler: ' + err.message, 'error'),
       },
     );
@@ -82,7 +106,7 @@ export function CategoryOverviewTable({ filters }: Props) {
         const isEmpty = cat.tx_count === 0;
 
         return (
-          <div key={cat.category_id} className={`bg-surface rounded-xl border border-border overflow-hidden ${isEmpty ? 'opacity-60' : ''}`}>
+          <div key={cat.category_id} className={`bg-surface rounded-xl border border-border ${isEmpty ? 'opacity-60' : ''}`}>
             <div
               className="grid grid-cols-[1fr_80px_100px_100px_60px_80px] gap-2 items-center px-4 py-3 cursor-pointer hover:bg-surface-2/50 transition-colors"
               onClick={() => !isRenaming && toggle(cat.category)}
@@ -113,6 +137,16 @@ export function CategoryOverviewTable({ filters }: Props) {
                         <PiggyBank size={10} /> Sparen
                       </span>
                     )}
+                    {cat.category_type === 'fallback' && (
+                      <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-text-3/10 text-text-3">
+                        <Archive size={10} /> Standard
+                      </span>
+                    )}
+                    {cat.category_type === 'transfer' && (
+                      <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-400">
+                        <ArrowLeftRight size={10} /> Umbuchung
+                      </span>
+                    )}
                   </>
                 )}
               </div>
@@ -127,13 +161,30 @@ export function CategoryOverviewTable({ filters }: Props) {
               <div className="flex items-center justify-end gap-1">
                 {!isSonstiges(cat.category) && !isRenaming && (
                   <>
-                    <button
-                      onClick={(e) => toggleSavings(cat, e)}
-                      className={`p-1 transition-colors rounded ${cat.category_type === 'savings' ? 'text-accent' : 'text-text-3 hover:text-accent'}`}
-                      title={cat.category_type === 'savings' ? 'Spar-Markierung entfernen' : 'Als Spar-Kategorie markieren'}
-                    >
-                      <PiggyBank size={13} />
-                    </button>
+                    <div className="relative" ref={typeMenuFor === cat.category_id ? typeMenuRef : undefined}>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setTypeMenuFor(typeMenuFor === cat.category_id ? null : cat.category_id); }}
+                        className={`p-1 transition-colors rounded ${cat.category_type !== 'default' ? (cat.category_type === 'savings' ? 'text-accent' : 'text-blue-400') : 'text-text-3 hover:text-accent'}`}
+                        title={TYPE_LABELS[cat.category_type] || 'Typ ändern'}
+                      >
+                        <Tag size={13} />
+                      </button>
+                      {typeMenuFor === cat.category_id && (
+                        <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-lg py-1 min-w-[160px]" onClick={(e) => e.stopPropagation()}>
+                          {CATEGORY_TYPES.map((t) => (
+                            <button
+                              key={t.value}
+                              onClick={() => setCategoryType(cat, t.value)}
+                              className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-surface-2/50 transition-colors ${cat.category_type === t.value ? 'font-semibold ' + t.color : 'text-text-2'}`}
+                            >
+                              {t.icon ? <t.icon size={12} /> : <span className="w-3" />}
+                              {t.label}
+                              {cat.category_type === t.value && <Check size={11} className="ml-auto" />}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     <button
                       onClick={(e) => startRename(cat, e)}
                       className="p-1 text-text-3 hover:text-accent transition-colors rounded"

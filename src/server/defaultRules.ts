@@ -1,6 +1,6 @@
 export interface DefaultCategory {
   name: string;
-  type: 'default' | 'savings';
+  type: 'default' | 'savings' | 'transfer' | 'fallback';
 }
 
 export const DEFAULT_CATEGORIES: DefaultCategory[] = [
@@ -38,8 +38,8 @@ export const DEFAULT_CATEGORIES: DefaultCategory[] = [
   { name: 'Einspeisung Photovoltaik', type: 'default' },
   { name: 'Sparen & Anlage', type: 'savings' },
   { name: 'Bargeldabhebung', type: 'default' },
-  { name: 'Umbuchung & Übertrag', type: 'default' },
-  { name: 'Sonstiges', type: 'default' },
+  { name: 'Umbuchung & Übertrag', type: 'transfer' },
+  { name: 'Sonstiges', type: 'fallback' },
 ];
 
 export const DEFAULT_RULES = [
