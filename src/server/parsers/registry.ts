@@ -38,6 +38,16 @@ export async function ensureBuiltinTemplates(): Promise<void> {
       },
     });
   }
+
+  // Remove orphaned built-in templates (e.g. csv-c24, csv-volksbank, csv-olb)
+  const builtinIds = BUILTIN_TEMPLATES.map(t => t.id);
+  await prisma.bankTemplate.deleteMany({ where: { is_builtin: true, id: { notIn: builtinIds } } });
+
+  // Migrate existing AI-generated templates (ai-* prefix)
+  await prisma.bankTemplate.updateMany({
+    where: { id: { startsWith: 'ai-' }, is_builtin: false },
+    data: { is_ai_generated: true },
+  });
 }
 
 /**
@@ -48,7 +58,7 @@ async function loadTemplates(): Promise<LoadedTemplate[]> {
 
   await ensureBuiltinTemplates();
 
-  const rows = await prisma.bankTemplate.findMany({ where: { enabled: true } });
+  const rows = await prisma.bankTemplate.findMany();
   templateCache = rows.map(row => {
     const parsed = JSON.parse(row.config);
     const format = parsed._format || 'csv';
@@ -110,11 +120,15 @@ export async function detectAllParsers(text: string): Promise<{ id: string; name
     if (matches.length > 0) return matches;
   }
 
-  // CSV templates: match by first-line header
-  const firstLine = text.split(/\r?\n/, 1)[0];
-  for (const t of templates) {
-    if (t.format && t.format !== 'csv') continue;
-    if (firstLine.startsWith(t.config.detection.headerStartsWith)) {
+  // CSV templates: match by first-line header (skip pdf format — handled separately)
+  const normalizedFirstLine = text.split(/\r?\n/, 1)[0].trim().replace(/^\uFEFF/, '');
+  const csvTemplates = templates.filter(t => !t.format || t.format === 'csv');
+
+  // Exact match first (AI templates store full header)
+  for (const t of csvTemplates) {
+    const det = t.config.detection.headerStartsWith?.trim();
+    if (!det) continue;
+    if (normalizedFirstLine === det) {
       matches.push({
         id: t.id,
         name: t.name,
@@ -128,6 +142,28 @@ export async function detectAllParsers(text: string): Promise<{ id: string; name
       });
     }
   }
+
+  // Fallback: startsWith (backward compat for manual templates)
+  if (matches.length === 0) {
+    for (const t of csvTemplates) {
+      const det = t.config.detection.headerStartsWith?.trim();
+      if (!det) continue;
+      if (normalizedFirstLine.startsWith(det)) {
+        matches.push({
+          id: t.id,
+          name: t.name,
+          parser: {
+            bankId: t.id,
+            bankName: t.name,
+            detect: () => true,
+            parse: (csv: string, filename: string) =>
+              parseWithTemplate(t.config, t.name, csv, filename),
+          },
+        });
+      }
+    }
+  }
+
   return matches;
 }
 
@@ -153,6 +189,16 @@ export async function getParserByTemplateId(text: string, templateId: string): P
       bankName: t.name,
       detect: () => true,
       parse: (content: string, filename: string) => parseCAMT052(content, filename),
+    };
+  }
+  // PDF format uses parseWithTemplate (AI output is CSV)
+  if (t.format === 'pdf') {
+    return {
+      bankId: t.id,
+      bankName: t.name,
+      detect: () => true,
+      parse: (csv: string, filename: string) =>
+        parseWithTemplate(t.config, t.name, csv, filename),
     };
   }
   // CSV
@@ -198,11 +244,15 @@ export async function detectParser(text: string): Promise<BankParser | null> {
     }
   }
 
-  // CSV templates: match by first-line header
-  const firstLine = text.split(/\r?\n/, 1)[0];
-  for (const t of templates) {
-    if (t.format && t.format !== 'csv') continue;
-    if (firstLine.startsWith(t.config.detection.headerStartsWith)) {
+  // CSV templates: match by first-line header (skip pdf format — handled separately)
+  const firstLineD = text.split(/\r?\n/, 1)[0].trim().replace(/^\uFEFF/, '');
+  const csvTmpl = templates.filter(t => !t.format || t.format === 'csv');
+
+  // Exact match first (AI templates store full header)
+  for (const t of csvTmpl) {
+    const det = t.config.detection.headerStartsWith?.trim();
+    if (!det) continue;
+    if (firstLineD === det) {
       return {
         bankId: t.id,
         bankName: t.name,
@@ -212,5 +262,21 @@ export async function detectParser(text: string): Promise<BankParser | null> {
       };
     }
   }
+
+  // Fallback: startsWith (backward compat for manual templates)
+  for (const t of csvTmpl) {
+    const det = t.config.detection.headerStartsWith?.trim();
+    if (!det) continue;
+    if (firstLineD.startsWith(det)) {
+      return {
+        bankId: t.id,
+        bankName: t.name,
+        detect: () => true,
+        parse: (csv: string, filename: string) =>
+          parseWithTemplate(t.config, t.name, csv, filename),
+      };
+    }
+  }
+
   return null;
 }

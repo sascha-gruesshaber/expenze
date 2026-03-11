@@ -1,6 +1,6 @@
 # expenze
 
-A self-hosted personal finance app for importing, categorizing, and analyzing bank transactions. Built for German banks with support for CSV, MT940, and CAMT.052 formats.
+A self-hosted personal finance app for importing, categorizing, and analyzing bank transactions. Built for German banks with support for CSV, MT940, CAMT.052, and PDF formats.
 
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)
 ![React](https://img.shields.io/badge/React-19-61dafb)
@@ -11,8 +11,9 @@ A self-hosted personal finance app for importing, categorizing, and analyzing ba
 ## Features
 
 ### Transaction Import
-- **Multi-format support**: CSV, MT940 (SWIFT), CAMT.052 (ISO 20022 XML)
-- **Built-in templates** for C24, Volksbank, and OLB
+- **Multi-format support**: CSV, MT940 (SWIFT), CAMT.052 (ISO 20022 XML), **PDF** (AI-powered)
+- **Preview-before-import flow** with duplicate detection
+- **AI-powered template generation** for unknown CSV formats
 - **Auto-detection** of file format and bank
 - **Custom templates** — create your own CSV column mappings via UI or AI
 - **Duplicate detection** with configurable hash fields
@@ -32,16 +33,23 @@ A self-hosted personal finance app for importing, categorizing, and analyzing ba
 - **Advanced visualizations**: Sankey diagram, spending treemap, stacked area chart, calendar heatmap
 - AI-generated spending insights
 
+### Account Groups
+- Organize bank accounts into logical groups (e.g. "Girokonten", "Sparkonten")
+- Group-level analysis — filter all analytics and chat queries by group
+- Cascading properties (account type, active status) from group to member accounts
+
 ### AI Chat
 - Ask questions about your finances in natural language
 - Streaming responses (SSE) with tool-calling (queries transactions, analyzes categories, summarizes stats)
 - Multiple LLM providers via OpenRouter (Gemini, Claude, DeepSeek, Qwen, etc.)
 - Model browser with pricing and context length info
+- Per-user API keys configured in settings
 
 ### Multi-User & Auth
 - Passwordless authentication (magic links + passkeys/WebAuthn)
 - Full data isolation between users
 - Per-user categories, rules, templates, and settings
+- Per-user OpenRouter API keys (stored in settings, not env)
 
 ### Other
 - German-localized UI
@@ -58,7 +66,7 @@ A self-hosted personal finance app for importing, categorizing, and analyzing ba
 | Database  | SQLite via Prisma 7                                |
 | Auth      | better-auth (magic link, passkeys)                 |
 | AI        | OpenRouter API, TanStack AI                        |
-| Charts    | Chart.js, Nivo (Sankey, Treemap, Calendar)         |
+| Charts    | Chart.js, Nivo (Sankey, Treemap, Calendar), pdfjs-dist |
 | Build     | Vite 6, TypeScript 5.7                             |
 | Deploy    | Docker / Docker Compose                            |
 
@@ -83,9 +91,6 @@ DATABASE_URL="file:../data/banking.db"
 BETTER_AUTH_SECRET="your-secret-at-least-32-characters-long"
 BETTER_AUTH_URL="http://localhost:3000"
 
-# Optional: AI features
-OPENROUTER_API_KEY="sk-or-..."
-
 # Optional: Email (magic links logged to console if omitted)
 SMTP_HOST=smtp.example.com
 SMTP_PORT=587
@@ -93,6 +98,8 @@ SMTP_USER=you@example.com
 SMTP_PASS=password
 SMTP_FROM=noreply@example.com
 ```
+
+AI features (chat, categorization, PDF import) require an OpenRouter API key — configure it per-user in Settings after login.
 
 ### Development
 
@@ -130,7 +137,9 @@ npm run db:generate   # Regenerate Prisma client
 src/
 ├── client/              # React frontend
 │   ├── components/      # UI components
+│   │   └── BankLogo.tsx # Bank logo resolver
 │   ├── lib/             # Auth client, API helpers
+│   │   └── sidebarContext.tsx
 │   └── routes/          # TanStack file-based routes
 │       ├── _app/        # Authenticated app routes
 │       │   ├── dashboard.tsx
@@ -153,6 +162,7 @@ src/
 │       ├── templateParser.ts
 │       ├── mt940Parser.ts
 │       ├── camt052Parser.ts
+│       ├── pdfParser.ts
 │       ├── csvUtils.ts
 │       └── registry.ts
 └── prisma/
@@ -178,7 +188,6 @@ src/
 | `BETTER_AUTH_SECRET`          | Yes      | Auth secret (32+ chars)                  |
 | `BETTER_AUTH_URL`             | Yes      | App URL for auth callbacks               |
 | `BETTER_AUTH_TRUSTED_ORIGINS` | No       | Comma-separated CORS origins             |
-| `OPENROUTER_API_KEY`          | No       | Enables AI features (chat, categorization, template generation) |
 | `SMTP_HOST`                   | No       | SMTP server for magic link emails        |
 | `SMTP_PORT`                   | No       | SMTP port                                |
 | `SMTP_USER`                   | No       | SMTP username                            |

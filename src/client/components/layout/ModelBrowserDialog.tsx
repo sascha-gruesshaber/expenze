@@ -69,7 +69,7 @@ export function ModelBrowserDialog({ open, onClose }: Props) {
 
   const handleSelect = (model: BrowseModel) => {
     if (!model.isFree && !hasKey) {
-      toast('API-Key erforderlich — setze OPENROUTER_API_KEY in .env', 'error');
+      toast('API-Key erforderlich — bitte in den Einstellungen hinterlegen', 'error');
       return;
     }
     setModel.mutate(model.id, {

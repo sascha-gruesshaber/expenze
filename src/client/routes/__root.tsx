@@ -6,6 +6,7 @@ import { FilterContext, type FilterState } from '../lib/filterContext';
 import { BatchCategorizationDialog } from '../components/categories/BatchCategorizationDialog';
 import { BatchFloatingIndicator } from '../components/layout/BatchFloatingIndicator';
 import { useSession } from '../lib/auth';
+import { SidebarProvider } from '../lib/sidebarContext';
 
 export const Route = createRootRoute({
   component: RootLayout,
@@ -46,18 +47,20 @@ function RootLayout() {
 
   // Authenticated: full layout
   return (
-    <FilterContext.Provider value={{ filters, setFilters }}>
-      <div className="flex h-screen overflow-hidden bg-bg">
-        <Sidebar />
-        <main className="flex-1 overflow-y-auto flex flex-col">
-          <Topbar filters={filters} setFilters={setFilters} />
-          <div className="p-6 flex-1">
-            <Outlet />
-          </div>
-        </main>
-      </div>
-      <BatchCategorizationDialog />
-      <BatchFloatingIndicator />
-    </FilterContext.Provider>
+    <SidebarProvider>
+      <FilterContext.Provider value={{ filters, setFilters }}>
+        <div className="flex h-screen overflow-hidden bg-bg">
+          <Sidebar />
+          <main className="flex-1 overflow-y-auto flex flex-col min-w-0">
+            <Topbar filters={filters} setFilters={setFilters} />
+            <div className="p-4 md:p-6 flex-1">
+              <Outlet />
+            </div>
+          </main>
+        </div>
+        <BatchCategorizationDialog />
+        <BatchFloatingIndicator />
+      </FilterContext.Provider>
+    </SidebarProvider>
   );
 }

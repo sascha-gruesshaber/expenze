@@ -90,8 +90,8 @@ export function CategoryOverviewTable({ filters }: Props) {
 
   return (
     <div className="space-y-1">
-      {/* Header */}
-      <div className="grid grid-cols-[1fr_80px_100px_100px_60px_80px] gap-2 px-4 py-2 text-[11px] uppercase tracking-wider text-text-3 font-semibold">
+      {/* Header — desktop only */}
+      <div className="hidden md:grid grid-cols-[1fr_80px_100px_100px_60px_80px] gap-2 px-4 py-2 text-[11px] uppercase tracking-wider text-text-3 font-semibold">
         <div>Kategorie</div>
         <div className="text-right">Buchungen</div>
         <div className="text-right">Ausgaben</div>
@@ -104,52 +104,24 @@ export function CategoryOverviewTable({ filters }: Props) {
         const isExpanded = expanded === cat.category;
         const isRenaming = renamingId === cat.category_id;
         const isEmpty = cat.tx_count === 0;
+        const showActions = !isSonstiges(cat.category) && !isRenaming;
 
         return (
           <div key={cat.category_id} className={`bg-surface rounded-xl border border-border ${isEmpty ? 'opacity-60' : ''}`}>
+            {/* ── Desktop row ── */}
             <div
-              className="grid grid-cols-[1fr_80px_100px_100px_60px_80px] gap-2 items-center px-4 py-3 cursor-pointer hover:bg-surface-2/50 transition-colors"
+              className="hidden md:grid grid-cols-[1fr_80px_100px_100px_60px_80px] gap-2 items-center px-4 py-3 cursor-pointer hover:bg-surface-2/50 transition-colors"
               onClick={() => !isRenaming && toggle(cat.category)}
             >
-              <div className="flex items-center gap-2 min-w-0">
-                {isExpanded ? <ChevronDown size={14} className="text-text-3 shrink-0" /> : <ChevronRight size={14} className="text-text-3 shrink-0" />}
-                {isRenaming ? (
-                  <div className="flex items-center gap-1 flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
-                    <input
-                      type="text"
-                      value={renameValue}
-                      onChange={(e) => setRenameValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') submitRename(cat);
-                        if (e.key === 'Escape') setRenamingId(null);
-                      }}
-                      autoFocus
-                      className="flex-1 min-w-0 text-[13px] font-medium bg-transparent border border-accent/40 rounded px-2 py-0.5 outline-none text-text"
-                    />
-                    <button onClick={() => submitRename(cat)} className="text-accent hover:text-accent/80"><Check size={14} /></button>
-                    <button onClick={() => setRenamingId(null)} className="text-text-3 hover:text-text"><X size={14} /></button>
-                  </div>
-                ) : (
-                  <>
-                    <span className="text-[13px] font-medium text-text truncate">{cat.category}</span>
-                    {cat.category_type === 'savings' && (
-                      <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-accent/10 text-accent">
-                        <PiggyBank size={10} /> Sparen
-                      </span>
-                    )}
-                    {cat.category_type === 'fallback' && (
-                      <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-text-3/10 text-text-3">
-                        <Archive size={10} /> Standard
-                      </span>
-                    )}
-                    {cat.category_type === 'transfer' && (
-                      <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-400">
-                        <ArrowLeftRight size={10} /> Umbuchung
-                      </span>
-                    )}
-                  </>
-                )}
-              </div>
+              <CategoryName
+                cat={cat}
+                isExpanded={isExpanded}
+                isRenaming={isRenaming}
+                renameValue={renameValue}
+                setRenameValue={setRenameValue}
+                submitRename={submitRename}
+                setRenamingId={setRenamingId}
+              />
               <div className="text-[13px] text-text-2 text-right">{cat.tx_count}</div>
               <div className="text-[13px] text-exp-red text-right font-medium">
                 {cat.total_debit > 0 ? fmt(cat.total_debit) : '—'}
@@ -158,52 +130,61 @@ export function CategoryOverviewTable({ filters }: Props) {
                 {cat.total_credit > 0 ? fmt(cat.total_credit) : '—'}
               </div>
               <div className="text-[13px] text-text-2 text-right">{cat.rule_count}</div>
-              <div className="flex items-center justify-end gap-1">
-                {!isSonstiges(cat.category) && !isRenaming && (
-                  <>
-                    <div className="relative" ref={typeMenuFor === cat.category_id ? typeMenuRef : undefined}>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setTypeMenuFor(typeMenuFor === cat.category_id ? null : cat.category_id); }}
-                        className={`p-1 transition-colors rounded ${cat.category_type !== 'default' ? (cat.category_type === 'savings' ? 'text-accent' : 'text-blue-400') : 'text-text-3 hover:text-accent'}`}
-                        title={TYPE_LABELS[cat.category_type] || 'Typ ändern'}
-                      >
-                        <Tag size={13} />
-                      </button>
-                      {typeMenuFor === cat.category_id && (
-                        <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-lg py-1 min-w-[160px]" onClick={(e) => e.stopPropagation()}>
-                          {CATEGORY_TYPES.map((t) => (
-                            <button
-                              key={t.value}
-                              onClick={() => setCategoryType(cat, t.value)}
-                              className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-surface-2/50 transition-colors ${cat.category_type === t.value ? 'font-semibold ' + t.color : 'text-text-2'}`}
-                            >
-                              {t.icon ? <t.icon size={12} /> : <span className="w-3" />}
-                              {t.label}
-                              {cat.category_type === t.value && <Check size={11} className="ml-auto" />}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      onClick={(e) => startRename(cat, e)}
-                      className="p-1 text-text-3 hover:text-accent transition-colors rounded"
-                      title="Umbenennen"
-                    >
-                      <Pencil size={13} />
-                    </button>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); setDeleteTarget(cat); }}
-                      className="p-1 text-text-3 hover:text-exp-red transition-colors rounded"
-                      title="Löschen"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </>
+              <ActionButtons
+                cat={cat}
+                show={showActions}
+                typeMenuFor={typeMenuFor}
+                typeMenuRef={typeMenuRef}
+                setTypeMenuFor={setTypeMenuFor}
+                setCategoryType={setCategoryType}
+                startRename={startRename}
+                setDeleteTarget={setDeleteTarget}
+              />
+            </div>
+
+            {/* ── Mobile row ── */}
+            <div
+              className="md:hidden px-4 py-3 cursor-pointer hover:bg-surface-2/50 transition-colors"
+              onClick={() => !isRenaming && toggle(cat.category)}
+            >
+              {/* Line 1: name + actions */}
+              <div className="flex items-center justify-between gap-2">
+                <CategoryName
+                  cat={cat}
+                  isExpanded={isExpanded}
+                  isRenaming={isRenaming}
+                  renameValue={renameValue}
+                  setRenameValue={setRenameValue}
+                  submitRename={submitRename}
+                  setRenamingId={setRenamingId}
+                />
+                <ActionButtons
+                  cat={cat}
+                  show={showActions}
+                  typeMenuFor={typeMenuFor}
+                  typeMenuRef={typeMenuRef}
+                  setTypeMenuFor={setTypeMenuFor}
+                  setCategoryType={setCategoryType}
+                  startRename={startRename}
+                  setDeleteTarget={setDeleteTarget}
+                />
+              </div>
+              {/* Line 2: stats */}
+              <div className="flex items-center gap-3 mt-2 text-[12px] flex-wrap">
+                <span className="text-text-2">{cat.tx_count} Buch.</span>
+                {cat.total_debit > 0 && (
+                  <span className="text-exp-red font-medium">&minus; {fmt(cat.total_debit)}</span>
+                )}
+                {cat.total_credit > 0 && (
+                  <span className="text-accent font-medium">+ {fmt(cat.total_credit)}</span>
+                )}
+                {cat.rule_count > 0 && (
+                  <span className="text-text-3">{cat.rule_count} Regeln</span>
                 )}
               </div>
             </div>
 
+            {/* ── Expanded area ── */}
             {isExpanded && (
               <div className="px-4 pb-4 border-t border-border/60">
                 <div className="pt-3">
@@ -253,6 +234,123 @@ export function CategoryOverviewTable({ filters }: Props) {
           onClose={() => setDeleteTarget(null)}
         />
       )}
+    </div>
+  );
+}
+
+/* ─── Sub-components ─────────────────────────────────────────────────── */
+
+function CategoryName({ cat, isExpanded, isRenaming, renameValue, setRenameValue, submitRename, setRenamingId }: {
+  cat: CategoryOverview;
+  isExpanded: boolean;
+  isRenaming: boolean;
+  renameValue: string;
+  setRenameValue: (v: string) => void;
+  submitRename: (cat: CategoryOverview) => void;
+  setRenamingId: (id: number | null) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      {isExpanded
+        ? <ChevronDown size={14} className="text-text-3 shrink-0" />
+        : <ChevronRight size={14} className="text-text-3 shrink-0" />
+      }
+      {isRenaming ? (
+        <div className="flex items-center gap-1 flex-1 min-w-0" onClick={(e) => e.stopPropagation()}>
+          <input
+            type="text"
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') submitRename(cat);
+              if (e.key === 'Escape') setRenamingId(null);
+            }}
+            autoFocus
+            className="flex-1 min-w-0 text-[13px] font-medium bg-transparent border border-accent/40 rounded px-2 py-0.5 outline-none text-text"
+          />
+          <button onClick={() => submitRename(cat)} className="text-accent hover:text-accent/80"><Check size={14} /></button>
+          <button onClick={() => setRenamingId(null)} className="text-text-3 hover:text-text"><X size={14} /></button>
+        </div>
+      ) : (
+        <>
+          <span className="text-[13px] font-medium text-text truncate">{cat.category}</span>
+          {cat.category_type === 'savings' && (
+            <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-accent/10 text-accent">
+              <PiggyBank size={10} /> Sparen
+            </span>
+          )}
+          {cat.category_type === 'fallback' && (
+            <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-text-3/10 text-text-3">
+              <Archive size={10} /> Standard
+            </span>
+          )}
+          {cat.category_type === 'transfer' && (
+            <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-400">
+              <ArrowLeftRight size={10} /> Umbuchung
+            </span>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActionButtons({ cat, show, typeMenuFor, typeMenuRef, setTypeMenuFor, setCategoryType, startRename, setDeleteTarget }: {
+  cat: CategoryOverview;
+  show: boolean;
+  typeMenuFor: number | null;
+  typeMenuRef: React.RefObject<HTMLDivElement | null>;
+  setTypeMenuFor: (id: number | null) => void;
+  setCategoryType: (cat: CategoryOverview, type: string) => void;
+  startRename: (cat: CategoryOverview, e: React.MouseEvent) => void;
+  setDeleteTarget: (cat: CategoryOverview | null) => void;
+}) {
+  if (!show) return <div />;
+
+  return (
+    <div className="flex items-center gap-1 shrink-0">
+      <div className="relative" ref={typeMenuFor === cat.category_id ? typeMenuRef : undefined}>
+        <button
+          onClick={(e) => { e.stopPropagation(); setTypeMenuFor(typeMenuFor === cat.category_id ? null : cat.category_id); }}
+          className={`p-1.5 rounded-lg transition-colors ${
+            cat.category_type !== 'default'
+              ? (cat.category_type === 'savings' ? 'text-accent bg-accent/10 hover:bg-accent/20' : 'text-blue-400 bg-blue-500/10 hover:bg-blue-500/20')
+              : 'text-text-3 hover:text-accent hover:bg-accent/10'
+          }`}
+          title={TYPE_LABELS[cat.category_type] || 'Typ ändern'}
+        >
+          <Tag size={14} />
+        </button>
+        {typeMenuFor === cat.category_id && (
+          <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-xl shadow-lg py-1 min-w-[160px] animate-dropdown" onClick={(e) => e.stopPropagation()}>
+            {CATEGORY_TYPES.map((t) => (
+              <button
+                key={t.value}
+                onClick={() => setCategoryType(cat, t.value)}
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-[12px] hover:bg-surface-2/50 transition-colors cursor-pointer ${cat.category_type === t.value ? 'font-semibold ' + t.color : 'text-text-2'}`}
+              >
+                {t.icon ? <t.icon size={12} /> : <span className="w-3" />}
+                {t.label}
+                {cat.category_type === t.value && <Check size={11} className="ml-auto" />}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <button
+        onClick={(e) => startRename(cat, e)}
+        className="p-1.5 rounded-lg text-text-3 hover:text-accent hover:bg-accent/10 transition-colors"
+        title="Umbenennen"
+      >
+        <Pencil size={14} />
+      </button>
+      <button
+        onClick={(e) => { e.stopPropagation(); setDeleteTarget(cat); }}
+        className="p-1.5 rounded-lg text-text-3 hover:text-red-500 hover:bg-red-500/10 transition-colors"
+        title="Löschen"
+      >
+        <Trash2 size={14} />
+      </button>
     </div>
   );
 }

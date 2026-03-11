@@ -49,6 +49,7 @@ export async function cleanDatabase() {
   await prisma.transaction.deleteMany();
   await prisma.importLog.deleteMany();
   await prisma.bankAccount.deleteMany();
+  await prisma.accountGroup.deleteMany();
   await prisma.categoryRule.deleteMany();
   await prisma.category.deleteMany();
   await prisma.bankTemplate.deleteMany({ where: { is_builtin: false } });
@@ -125,6 +126,20 @@ export async function seedDefaultCategories() {
       },
     });
   }
+}
+
+export async function seedImportLog(overrides: Partial<{
+  filename: string; records_imported: number; records_skipped: number;
+}> = {}) {
+  return prisma.importLog.create({
+    data: {
+      filename: overrides.filename ?? 'test.csv',
+      imported_at: new Date().toISOString(),
+      records_imported: overrides.records_imported ?? 5,
+      records_skipped: overrides.records_skipped ?? 0,
+      userId: 'test-user-id',
+    },
+  });
 }
 
 export async function seedRule(overrides: Partial<{

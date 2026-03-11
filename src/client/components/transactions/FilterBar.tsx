@@ -33,20 +33,20 @@ export function FilterBar({
 
   return (
     <div className="flex gap-3 items-center mb-4 flex-wrap">
-      <div className="relative">
+      <div className="relative w-full md:w-auto">
         <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-text-3" />
         <input
           type="text"
           defaultValue={search}
           placeholder="Suchen..."
           onChange={(e) => handleSearchInput(e.target.value)}
-          className="bg-surface border border-border text-text font-body text-[13px] pl-9 pr-3 py-2 rounded-xl outline-none min-w-[220px] focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft transition-colors"
+          className="bg-surface border border-border text-text font-body text-[13px] pl-9 pr-3 py-2 rounded-xl outline-none w-full md:min-w-[220px] focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft transition-colors"
         />
       </div>
       <select
         value={direction}
         onChange={(e) => onDirectionChange(e.target.value)}
-        className="bg-surface border border-border text-text font-body text-[13px] px-3 py-2 rounded-xl outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft cursor-pointer transition-colors"
+        className="bg-surface border border-border text-text font-body text-[13px] px-3 py-2 rounded-xl outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft cursor-pointer transition-colors flex-1 md:flex-none"
       >
         <option value="">Alle Typen</option>
         <option value="credit">Einnahmen</option>
@@ -55,7 +55,7 @@ export function FilterBar({
       <select
         value={category}
         onChange={(e) => onCategoryChange(e.target.value)}
-        className="bg-surface border border-border text-text font-body text-[13px] px-3 py-2 rounded-xl outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft cursor-pointer transition-colors"
+        className="bg-surface border border-border text-text font-body text-[13px] px-3 py-2 rounded-xl outline-none focus:border-accent focus:ring-1 focus:ring-accent/20 shadow-soft cursor-pointer transition-colors flex-1 md:flex-none"
       >
         <option value="">Alle Kategorien</option>
         {categories.map((c) => (

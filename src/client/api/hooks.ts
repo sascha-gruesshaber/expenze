@@ -1,6 +1,69 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiFetch, apiPost, apiPatch, apiDelete } from './client';
 
+// ── OpenRouter API Key ───────────────────────────────────────────────
+
+export interface ApiKeyStatus {
+  hasKey: boolean;
+  maskedKey: string;
+}
+
+export function useApiKey() {
+  return useQuery<ApiKeyStatus>({
+    queryKey: ['apiKey'],
+    queryFn: () => apiFetch('/settings/api-key'),
+  });
+}
+
+export function useSaveApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (apiKey: string) =>
+      apiFetch<{ success: boolean }>('/settings/api-key', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['apiKey'] });
+      qc.invalidateQueries({ queryKey: ['aiModel'] });
+    },
+  });
+}
+
+export function useDeleteApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiDelete<{ success: boolean }>('/settings/api-key'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['apiKey'] });
+      qc.invalidateQueries({ queryKey: ['aiModel'] });
+    },
+  });
+}
+
+// ── AI Import Consent ───────────────────────────────────────────────
+
+export function useAiImportSetting() {
+  return useQuery<{ allowed: boolean }>({
+    queryKey: ['aiImportSetting'],
+    queryFn: () => apiFetch('/settings/ai-import'),
+  });
+}
+
+export function useSaveAiImportSetting() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (allowed: boolean) =>
+      apiFetch<{ success: boolean; allowed: boolean }>('/settings/ai-import', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allowed }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['aiImportSetting'] }),
+  });
+}
+
 // ── AI Model Settings ───────────────────────────────────────────────
 
 export interface AiModelSettings {
@@ -138,6 +201,7 @@ export interface ImportResult {
   importId?: string;
   conflict?: boolean;
   matchingTemplates?: { id: string; name: string }[];
+  saldoWarning?: string;
 }
 
 export interface ImportProgressResponse {
@@ -155,6 +219,94 @@ export interface ImportProgressResponse {
 
 export function fetchImportStatus(importId: string): Promise<ImportProgressResponse> {
   return apiFetch<ImportProgressResponse>(`/import/${importId}/status`);
+}
+
+// ── PDF Import Preview ──────────────────────────────────────────────
+
+export interface PreviewTransaction {
+  bu_date: string | null;
+  counterparty: string;
+  description: string;
+  amount: number;
+  direction: 'credit' | 'debit';
+  type: string;
+  purpose: string | null;
+  currency: string | null;
+  balance_after: number | null;
+  counterparty_iban: string | null;
+  isDuplicate: boolean;
+}
+
+export interface ImportPreviewResponse {
+  previewId: string;
+  filename: string;
+  bank: string;
+  total: number;
+  newCount: number;
+  duplicateCount: number;
+  saldoWarning?: string;
+  transactions: PreviewTransaction[];
+  accountInfo?: { accountNumber?: string; iban?: string; bankName?: string };
+  conflict?: boolean;
+  matchingTemplates?: { id: string; name: string }[];
+  aiGenerated?: boolean;
+  requiresAiConsent?: boolean;
+  reason?: 'pdf' | 'csv';
+}
+
+export interface ImportConfirmResponse {
+  success: boolean;
+  importId: string;
+  total: number;
+  bank: string;
+  filename: string;
+}
+
+export function uploadForPreview(file: File, templateId?: string): Promise<ImportPreviewResponse> {
+  const fd = new FormData();
+  fd.append('file', file);
+  if (templateId) fd.append('templateId', templateId);
+  return apiPost<ImportPreviewResponse>('/import/preview', fd);
+}
+
+export function confirmImport(previewId: string, bankName?: string): Promise<ImportConfirmResponse> {
+  return apiPost<ImportConfirmResponse>('/import/confirm', { previewId, bankName });
+}
+
+export function discardPreview(previewId: string): Promise<void> {
+  return apiFetch('/import/preview/' + previewId, { method: 'DELETE' });
+}
+
+export interface ImportTransaction {
+  id: number;
+  bu_date: string | null;
+  value_date: string | null;
+  type: string;
+  description: string;
+  counterparty: string;
+  amount: number;
+  direction: 'credit' | 'debit';
+  category: string;
+  source_file: string;
+  counterparty_iban: string | null;
+  purpose: string | null;
+  currency: string | null;
+  balance_after: number | null;
+  bank_name: string;
+  account_name: string;
+}
+
+export interface ImportDetailResponse {
+  import: ImportLogEntry;
+  transactions: ImportTransaction[];
+}
+
+export function useImportTransactions(importId: number | null) {
+  return useQuery<ImportDetailResponse>({
+    queryKey: ['importTransactions', importId],
+    queryFn: () => apiFetch<ImportDetailResponse>(`/imports/${importId}/transactions`),
+    enabled: importId !== null,
+  });
 }
 
 export interface CategoryRule {
@@ -210,17 +362,44 @@ export interface Account {
   name: string;
   iban: string | null;
   account_number: string | null;
+  bic: string | null;
   bank: string;
+  holder: string | null;
   account_type: string;
   is_active: boolean;
+  currency: string;
+  notes: string | null;
   created_at: string | null;
+  transaction_count: number;
+  group_id: number | null;
+}
+
+export interface AccountGroupMember {
+  id: number;
+  name: string;
+  bank: string;
+  iban: string | null;
+  account_type: string;
+  transaction_count: number;
+}
+
+export interface AccountGroup {
+  id: number;
+  name: string;
+  account_type: string;
+  is_active: boolean;
+  accounts: AccountGroupMember[];
   transaction_count: number;
 }
 
 // Helper: build account query params
 function accountParams(params: URLSearchParams, account: string) {
   if (account && account !== 'all') {
-    params.set('account_id', account);
+    if (account.startsWith('group:')) {
+      params.set('group_id', account.slice(6));
+    } else {
+      params.set('account_id', account);
+    }
   }
   if (account === 'all') {
     params.set('include_savings', 'true');
@@ -250,10 +429,12 @@ export function useMonthlyAnalysis(account?: string) {
   });
 }
 
-export function useCategories(filters: { year?: string; month?: string; direction?: string; account?: string }) {
+export function useCategories(filters: { year?: string; month?: string; direction?: string; account?: string; dateFrom?: string; dateTo?: string }) {
   const params = new URLSearchParams();
   if (filters.year) params.set('year', filters.year);
   if (filters.month) params.set('month', filters.month);
+  if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
+  if (filters.dateTo) params.set('dateTo', filters.dateTo);
   if (filters.direction) params.set('direction', filters.direction);
   if (filters.account) accountParams(params, filters.account);
   const qs = params.toString();
@@ -293,11 +474,11 @@ export function useAccounts() {
 }
 
 // Mutations
-export function useImportFiles() {
+export function useDeleteImport() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (formData: FormData) =>
-      apiPost<{ success: boolean; results: ImportResult[] }>('/import', formData),
+    mutationFn: (id: number) =>
+      apiDelete<{ success: boolean; deleted_transactions: number; filename: string }>(`/imports/${id}`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['summary'] });
       qc.invalidateQueries({ queryKey: ['transactions'] });
@@ -325,7 +506,7 @@ export function useUpdateCategory() {
 export function useUpdateAccount() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: number; name?: string; account_type?: string; bank?: string; is_active?: boolean }) =>
+    mutationFn: ({ id, ...data }: { id: number; name?: string; account_type?: string; bank?: string; is_active?: boolean; iban?: string; account_number?: string; bic?: string; holder?: string; currency?: string; notes?: string }) =>
       apiPatch<Account>(`/accounts/${id}`, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['accounts'] });
@@ -351,6 +532,78 @@ export function useDeleteAccount() {
   });
 }
 
+// ── Account Groups ───────────────────────────────────────────────────
+
+export function useAccountGroups() {
+  return useQuery<AccountGroup[]>({
+    queryKey: ['accountGroups'],
+    queryFn: () => apiFetch('/account-groups'),
+  });
+}
+
+export function useCreateAccountGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { name: string; accountIds?: number[] }) =>
+      apiPost<AccountGroup>('/account-groups', data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accountGroups'] });
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+    },
+  });
+}
+
+export function useUpdateAccountGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: number; name?: string; account_type?: string; is_active?: boolean }) =>
+      apiPatch<AccountGroup>(`/account-groups/${id}`, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accountGroups'] });
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+      qc.invalidateQueries({ queryKey: ['summary'] });
+      qc.invalidateQueries({ queryKey: ['monthly'] });
+      qc.invalidateQueries({ queryKey: ['categories'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+    },
+  });
+}
+
+export function useDeleteAccountGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => apiDelete<{ success: boolean }>(`/account-groups/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accountGroups'] });
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+    },
+  });
+}
+
+export function useAddAccountsToGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ groupId, accountIds }: { groupId: number; accountIds: number[] }) =>
+      apiPost<{ success: boolean }>(`/account-groups/${groupId}/accounts`, { accountIds }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accountGroups'] });
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+    },
+  });
+}
+
+export function useRemoveAccountFromGroup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ groupId, accountId }: { groupId: number; accountId: number }) =>
+      apiDelete<{ success: boolean }>(`/account-groups/${groupId}/accounts/${accountId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['accountGroups'] });
+      qc.invalidateQueries({ queryKey: ['accounts'] });
+    },
+  });
+}
+
 // Category Rules hooks
 export function useCategoryRules() {
   return useQuery<CategoryRule[]>({
@@ -359,15 +612,17 @@ export function useCategoryRules() {
   });
 }
 
-export function useCategoryOverview(filters?: { year?: string; month?: string; account?: string }) {
+export function useCategoryOverview(filters?: { year?: string; month?: string; account?: string; dateFrom?: string; dateTo?: string }) {
   const params = new URLSearchParams();
   if (filters?.year) params.set('year', filters.year);
   if (filters?.month) params.set('month', filters.month);
+  if (filters?.dateFrom) params.set('dateFrom', filters.dateFrom);
+  if (filters?.dateTo) params.set('dateTo', filters.dateTo);
   if (filters?.account) accountParams(params, filters.account);
   const qs = params.toString();
 
   return useQuery<CategoryOverview[]>({
-    queryKey: ['categoryOverview', filters?.year || '', filters?.month || '', filters?.account || ''],
+    queryKey: ['categoryOverview', filters?.year || '', filters?.month || '', filters?.account || '', filters?.dateFrom || '', filters?.dateTo || ''],
     queryFn: () => apiFetch(`/categories/overview${qs ? `?${qs}` : ''}`),
   });
 }
@@ -486,9 +741,12 @@ export interface BankTemplate {
   version: number;
   config: any;
   is_builtin: boolean;
+  is_ai_generated: boolean;
   enabled: boolean;
   created_at: string | null;
   updated_at: string | null;
+  matchedAccounts?: { name: string; bank: string; txCount: number }[];
+  txCount?: number;
 }
 
 export function useBankTemplates() {
@@ -510,7 +768,7 @@ export function useCreateBankTemplate() {
 export function useUpdateBankTemplate() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...data }: { id: string; name?: string; config?: any; enabled?: boolean }) =>
+    mutationFn: ({ id, ...data }: { id: string; name?: string; config?: any }) =>
       apiPatch<BankTemplate>(`/bank-templates/${id}`, data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bankTemplates'] }),
   });
@@ -531,15 +789,6 @@ export function useTestBankTemplate() {
   });
 }
 
-// ── AI Template Generation ──────────────────────────────────────────
-
-export function useGenerateTemplate() {
-  return useMutation({
-    mutationFn: (data: { csvSample: string }) =>
-      apiPost<{ config: any }>('/ai/generate-template', data),
-  });
-}
-
 // ── Batch AI Categorization ─────────────────────────────────────────
 
 export interface BatchSuggestion {
@@ -548,10 +797,6 @@ export interface BatchSuggestion {
   suggested_category: string;
   is_new_category: boolean;
   confidence: 'high' | 'medium' | 'low';
-  rule_pattern: string;
-  rule_match_type: 'keyword' | 'regex';
-  rule_match_field: 'counterparty' | 'description' | 'both';
-  explanation: string;
   count: number;
 }
 
@@ -569,7 +814,6 @@ export interface BatchApplyAction {
   transaction_ids: number[];
   category: string;
   create_rule: boolean;
-  rule?: { pattern: string; match_type: string; match_field: string };
 }
 
 export interface BatchApplyResponse {
@@ -605,10 +849,12 @@ export interface CategoryMonthly {
   categories: Record<string, number>;
 }
 
-export function useFlowAnalysis(filters: { year?: string; month?: string; account?: string }) {
+export function useFlowAnalysis(filters: { year?: string; month?: string; account?: string; dateFrom?: string; dateTo?: string }) {
   const params = new URLSearchParams();
   if (filters.year) params.set('year', filters.year);
   if (filters.month) params.set('month', filters.month);
+  if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
+  if (filters.dateTo) params.set('dateTo', filters.dateTo);
   if (filters.account) accountParams(params, filters.account);
   const qs = params.toString();
 
@@ -618,9 +864,11 @@ export function useFlowAnalysis(filters: { year?: string; month?: string; accoun
   });
 }
 
-export function useDailySpending(filters: { year?: string; account?: string }) {
+export function useDailySpending(filters: { year?: string; account?: string; dateFrom?: string; dateTo?: string }) {
   const params = new URLSearchParams();
   if (filters.year) params.set('year', filters.year);
+  if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
+  if (filters.dateTo) params.set('dateTo', filters.dateTo);
   if (filters.account) accountParams(params, filters.account);
   const qs = params.toString();
 
@@ -630,9 +878,11 @@ export function useDailySpending(filters: { year?: string; account?: string }) {
   });
 }
 
-export function useCategoryMonthly(filters: { year?: string; account?: string }) {
+export function useCategoryMonthly(filters: { year?: string; account?: string; dateFrom?: string; dateTo?: string }) {
   const params = new URLSearchParams();
   if (filters.year) params.set('year', filters.year);
+  if (filters.dateFrom) params.set('dateFrom', filters.dateFrom);
+  if (filters.dateTo) params.set('dateTo', filters.dateTo);
   if (filters.account) accountParams(params, filters.account);
   const qs = params.toString();
 

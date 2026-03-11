@@ -6,11 +6,11 @@ import { Prisma } from '../generated/prisma/client.js';
 import { categorizeWithRules, computeHash, extractCounterpartyIban, type DbCategoryRule, type BankTemplateConfig } from './parsers/types.js';
 import { ensureBuiltinTemplates, invalidateTemplateCache } from './parsers/registry.js';
 import { parseWithTemplate } from './parsers/templateParser.js';
-import { suggestCategoryPattern, categorizeGroup, generateTemplateConfig, PRESET_MODELS, FREE_MODEL, hasApiKey, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
+import { suggestCategoryPattern, categorizeGroups, PRESET_MODELS, FREE_MODEL, hasApiKeyForUser, getApiKeyForUser, fetchAllModels, fetchZdrModelIds, fetchAvailableModelIds, type CounterpartyGroup } from './ai.js';
 import { DEFAULT_RULES, DEFAULT_CATEGORIES } from './defaultRules.js';
 import { requireAuth } from './authMiddleware.js';
 import { chatRouter } from './chat.js';
-import { createJob, getJob, processImportInBackground } from './importManager.js';
+import { createJob, getJob, processImportInBackground, createPreview, getPreview, deletePreview } from './importManager.js';
 
 const router = Router();
 
@@ -160,7 +160,8 @@ async function findOrCreateAccount(tx: { iban: string | null; account_number: st
   return account.id;
 }
 
-// Import CSV — non-blocking with progress tracking
+// Import — non-blocking with progress tracking
+// PDF files should use /import/preview first, then /import/confirm
 router.post('/import', upload.array('files'), async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
@@ -172,6 +173,14 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
     const dbRules = await prisma.categoryRule.findMany({ where: { userId } }) as unknown as DbCategoryRule[];
 
     for (const file of files) {
+      const ext = file.originalname.toLowerCase().split('.').pop() || '';
+
+      // PDF files must go through preview flow
+      if (ext === 'pdf') {
+        results.push({ filename: file.originalname, error: 'PDF-Dateien müssen über die Vorschau importiert werden.' });
+        continue;
+      }
+
       // If no explicit templateId, check for conflicts
       if (!templateId) {
         const matchingTemplates = await detectTemplates(file.buffer, file.originalname);
@@ -181,7 +190,7 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
         }
       }
 
-      const { transactions, detectedBank } = await parseFile(file.buffer, file.originalname, templateId);
+      const { transactions, detectedBank } = await parseFile(file.buffer, file.originalname, templateId, userId);
 
       // Pre-compute dedup keys and batch-check for existing duplicates (user-scoped)
       const dedupKeys = transactions.map(tx => computeDedupKey(tx));
@@ -215,6 +224,232 @@ router.post('/import', upload.array('files'), async (req: Request, res: Response
   }
 });
 
+// PDF preview — parse and return transactions for review before committing
+router.post('/import/preview', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const file = req.file as Express.Multer.File;
+    if (!file) {
+      res.status(400).json({ error: 'Keine Datei hochgeladen' });
+      return;
+    }
+
+    const templateId = (req.body?.templateId as string) || undefined;
+    const ext = file.originalname.toLowerCase().split('.').pop() || '';
+
+    // If no explicit templateId, check for template conflicts (same logic as POST /import)
+    if (!templateId) {
+      if (ext !== 'pdf') {
+        const matchingTemplates = await detectTemplates(file.buffer, file.originalname);
+        if (matchingTemplates.length > 1) {
+          res.json({ conflict: true, matchingTemplates });
+          return;
+        }
+        // If no templates match a CSV, AI will be needed as fallback
+        if (ext === 'csv' && matchingTemplates.length === 0) {
+          const aiSetting = await prisma.setting.findFirst({ where: { key: 'ai_import_allowed', userId } });
+          if (aiSetting?.value !== 'true') {
+            res.json({ requiresAiConsent: true, reason: 'csv' });
+            return;
+          }
+        }
+      }
+    }
+
+    // PDFs always need AI
+    if (ext === 'pdf') {
+      const aiSetting = await prisma.setting.findFirst({ where: { key: 'ai_import_allowed', userId } });
+      if (aiSetting?.value !== 'true') {
+        res.json({ requiresAiConsent: true, reason: 'pdf' });
+        return;
+      }
+    }
+
+    const { transactions, detectedBank, saldoWarning, accountInfo, generatedConfig } = await parseFile(file.buffer, file.originalname, templateId, userId);
+
+    if (transactions.length === 0) {
+      res.status(400).json({ error: 'Keine Transaktionen in der Datei erkannt.' });
+      return;
+    }
+
+    // Compute dedup info for preview
+    const dedupKeys = transactions.map(tx => computeDedupKey(tx));
+    const uniqueDedupKeys = [...new Set(dedupKeys.filter(Boolean))];
+    const existingDedupKeys = new Set<string>();
+    for (let i = 0; i < uniqueDedupKeys.length; i += 500) {
+      const batch = uniqueDedupKeys.slice(i, i + 500);
+      const rows = await prisma.transaction.findMany({
+        where: {
+          dedup_key: { in: batch },
+          account: { userId },
+        },
+        select: { dedup_key: true },
+      });
+      for (const r of rows) {
+        if (r.dedup_key) existingDedupKeys.add(r.dedup_key);
+      }
+    }
+
+    const duplicateCount = dedupKeys.filter(k => k && existingDedupKeys.has(k)).length;
+    const newCount = transactions.length - duplicateCount;
+
+    // Cache the preview for later confirmation
+    const isPdf = file.originalname.toLowerCase().endsWith('.pdf');
+    const previewId = createPreview(file.originalname, transactions, detectedBank, saldoWarning, undefined, undefined, isPdf ? file.buffer : undefined, generatedConfig);
+
+    // Build simplified transaction list for client display
+    const previewTransactions = transactions.map((tx, i) => ({
+      bu_date: tx.bu_date,
+      counterparty: tx.counterparty,
+      description: tx.description,
+      amount: tx.amount,
+      direction: tx.direction,
+      type: tx.type,
+      purpose: tx.purpose,
+      currency: tx.currency,
+      balance_after: tx.balance_after,
+      counterparty_iban: tx.counterparty_iban,
+      isDuplicate: !!(dedupKeys[i] && existingDedupKeys.has(dedupKeys[i])),
+    }));
+
+    res.json({
+      previewId,
+      filename: file.originalname,
+      bank: detectedBank,
+      total: transactions.length,
+      newCount,
+      duplicateCount,
+      saldoWarning,
+      transactions: previewTransactions,
+      accountInfo,
+      aiGenerated: !!generatedConfig,
+    });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Confirm a previewed import
+router.post('/import/confirm', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const { previewId, bankName: overrideBankName } = req.body;
+    if (!previewId) {
+      res.status(400).json({ error: 'Keine Vorschau-ID angegeben' });
+      return;
+    }
+
+    const preview = getPreview(previewId);
+    if (!preview) {
+      res.status(404).json({ error: 'Vorschau abgelaufen oder nicht gefunden. Bitte erneut hochladen.' });
+      return;
+    }
+
+    // Apply bank name override if provided (user edited it in the preview)
+    const effectiveBankName = overrideBankName?.trim() || preview.bank;
+    if (overrideBankName?.trim()) {
+      // Update bank_name on all transactions so the correct account is created/matched
+      for (const tx of preview.transactions) {
+        tx.bank_name = overrideBankName.trim();
+      }
+      preview.bank = overrideBankName.trim();
+    }
+
+    // Run the normal import pipeline
+    const dbRules = await prisma.categoryRule.findMany({ where: { userId } }) as unknown as DbCategoryRule[];
+
+    const dedupKeys = preview.transactions.map(tx => computeDedupKey(tx));
+    const uniqueDedupKeys = [...new Set(dedupKeys.filter(Boolean))];
+    const existingDedupKeys = new Set<string>();
+    for (let i = 0; i < uniqueDedupKeys.length; i += 500) {
+      const batch = uniqueDedupKeys.slice(i, i + 500);
+      const rows = await prisma.transaction.findMany({
+        where: {
+          dedup_key: { in: batch },
+          account: { userId },
+        },
+        select: { dedup_key: true },
+      });
+      for (const r of rows) {
+        if (r.dedup_key) existingDedupKeys.add(r.dedup_key);
+      }
+    }
+
+    const importId = createJob(preview.filename, preview.transactions.length, preview.bank);
+    processImportInBackground(importId, preview.transactions, existingDedupKeys, dedupKeys, dbRules, userId);
+
+    // Auto-save AI-generated template so future uploads of same format are recognized
+    if (preview.generatedConfig) {
+      const { config } = preview.generatedConfig;
+      const templateBankName = overrideBankName?.trim() || preview.generatedConfig.bankName;
+      try {
+        // Check for existing template with same full header (dedup)
+        const headerToMatch = config.detection.headerStartsWith?.trim();
+        const existingTemplates = await prisma.bankTemplate.findMany({ where: { userId, is_builtin: false } });
+        const duplicate = headerToMatch && existingTemplates.find(t => {
+          const parsed = JSON.parse(t.config);
+          return parsed.detection?.headerStartsWith?.trim() === headerToMatch;
+        });
+
+        if (!duplicate) {
+          const templateId = `ai-${config.detection.headerStartsWith.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase().slice(0, 40)}-${Date.now()}`;
+          await prisma.bankTemplate.create({
+            data: {
+              id: templateId,
+              name: `${templateBankName} (KI-generiert)`,
+              config: JSON.stringify(config),
+              is_builtin: false,
+              is_ai_generated: true,
+              enabled: true,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              userId,
+            },
+          });
+          invalidateTemplateCache();
+        }
+      } catch {
+        // Template save is best-effort — don't fail the import
+      }
+    }
+
+    // Clean up preview cache
+    deletePreview(previewId);
+
+    res.json({
+      success: true,
+      importId,
+      total: preview.transactions.length,
+      bank: preview.bank,
+      filename: preview.filename,
+    });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Discard a preview
+router.delete('/import/preview/:id', (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  deletePreview(id);
+  res.json({ success: true });
+});
+
+// Serve the original PDF from a preview (for the side-by-side viewer)
+router.get('/import/preview/:id/pdf', (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const preview = getPreview(id);
+  if (!preview?.pdfBuffer) {
+    res.status(404).json({ error: 'PDF nicht gefunden' });
+    return;
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="${preview.filename}"`);
+  res.send(preview.pdfBuffer);
+});
+
 // Import progress polling
 router.get('/import/:id/status', (req: Request, res: Response) => {
   const id = req.params.id as string;
@@ -226,6 +461,79 @@ router.get('/import/:id/status', (req: Request, res: Response) => {
   res.json(job);
 });
 
+// Import detail — transactions belonging to a specific import
+router.get('/imports/:id/transactions', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const importId = parseInt(req.params.id as string);
+    if (isNaN(importId)) {
+      res.status(400).json({ error: 'Ungültige Import-ID' });
+      return;
+    }
+
+    // Get the import log entry
+    const importEntry = await prisma.importLog.findFirst({
+      where: { id: importId, userId },
+    });
+    if (!importEntry) {
+      res.status(404).json({ error: 'Import nicht gefunden' });
+      return;
+    }
+
+    // Find transactions matching this import's filename (user-scoped)
+    const sql = `
+      SELECT t.*, a.bank as bank_name, a.name as account_name
+      FROM transactions t
+      INNER JOIN bank_accounts a ON t.account_id = a.id AND a.userId = ?
+      WHERE t.source_file = ?
+      ORDER BY t.bu_date DESC
+    `;
+    const transactions = await prisma.$queryRawUnsafe(sql, userId, importEntry.filename);
+
+    res.json({
+      import: importEntry,
+      transactions: serialize(transactions),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete an import and its associated transactions
+router.delete('/imports/:id', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+
+    const importEntry = await prisma.importLog.findFirst({
+      where: { id, userId },
+    });
+    if (!importEntry) {
+      res.status(404).json({ error: 'Import nicht gefunden' });
+      return;
+    }
+
+    // Delete transactions matching this import's filename (user-scoped)
+    const deleted = await prisma.transaction.deleteMany({
+      where: {
+        source_file: importEntry.filename,
+        account: { userId },
+      },
+    });
+
+    // Delete the import log entry
+    await prisma.importLog.delete({ where: { id } });
+
+    res.json({
+      success: true,
+      deleted_transactions: deleted.count,
+      filename: importEntry.filename,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Helper: exclude transfer categories (Umbuchungen) from analysis queries
 function excludeTransfersSql(params: any[], userId: string): string {
   params.push(userId);
@@ -234,12 +542,29 @@ function excludeTransfersSql(params: any[], userId: string): string {
 
 // Helper: build account filter SQL clause (user-scoped)
 // Requires the main query to use INNER JOIN bank_accounts a ON t.account_id = a.id
-function accountFilterSql(params: any[], query: Record<string, string>, userId: string): string {
+// Resolve group_id to array of account IDs belonging to that group (user-scoped)
+async function resolveAccountIds(query: Record<string, string>, userId: string): Promise<string | undefined> {
+  const { group_id } = query;
+  if (!group_id) return undefined;
+  const accounts = await prisma.bankAccount.findMany({
+    where: { group_id: parseInt(group_id), userId },
+    select: { id: true },
+  });
+  if (accounts.length === 0) return undefined;
+  return accounts.map(a => a.id).join(',');
+}
+
+function accountFilterSql(params: any[], query: Record<string, string | undefined>, userId: string): string {
   let sql = ' AND a.userId = ?';
   params.push(userId);
 
-  const { account_id, include_savings } = query;
-  if (account_id) {
+  const { account_id, account_ids, include_savings } = query;
+  if (account_ids) {
+    // Multiple account IDs (from group resolution) — use IN clause
+    const ids = account_ids.split(',').map(id => parseInt(id));
+    sql += ` AND t.account_id IN (${ids.map(() => '?').join(',')})`;
+    params.push(...ids);
+  } else if (account_id) {
     sql += ' AND t.account_id = ?';
     params.push(parseInt(account_id));
   } else {
@@ -255,14 +580,17 @@ function accountFilterSql(params: any[], query: Record<string, string>, userId: 
 router.get('/transactions', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { month, year, direction, category, search, limit = '500', account_id, include_savings } = req.query as Record<string, string>;
+    const { month, year, direction, category, search, limit = '500', account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     let sql = 'SELECT t.*, a.bank as bank_name FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE 1=1';
     const params: any[] = [];
 
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
     if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
+    if (dateFrom) { sql += ` AND t.bu_date >= ?`; params.push(dateFrom); }
+    if (dateTo) { sql += ` AND t.bu_date <= ?`; params.push(dateTo); }
     if (direction) { sql += ' AND t.direction = ?'; params.push(direction); }
     if (category) { sql += ' AND t.category = ?'; params.push(category); }
     if (search) { sql += ' AND (t.description LIKE ? OR t.counterparty LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
@@ -281,7 +609,8 @@ router.get('/transactions', async (req: Request, res: Response) => {
 router.get('/analysis/monthly', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { account_id, include_savings } = req.query as Record<string, string>;
+    const { account_id, include_savings, group_id } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
     let sql = `
       SELECT
         strftime('%Y-%m', t.bu_date) as month,
@@ -293,7 +622,7 @@ router.get('/analysis/monthly', async (req: Request, res: Response) => {
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     sql += excludeTransfersSql(params, userId);
     sql += ' GROUP BY month ORDER BY month ASC';
 
@@ -308,7 +637,8 @@ router.get('/analysis/monthly', async (req: Request, res: Response) => {
 router.get('/analysis/categories', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { year, month, direction = 'debit', account_id, include_savings } = req.query as Record<string, string>;
+    const { year, month, direction = 'debit', account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     let sql = `
       SELECT t.category,
@@ -322,10 +652,12 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
     `;
     const params: any[] = [userId, direction];
 
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     sql += excludeTransfersSql(params, userId);
     if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
     if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
+    if (dateFrom) { sql += ` AND t.bu_date >= ?`; params.push(dateFrom); }
+    if (dateTo) { sql += ` AND t.bu_date <= ?`; params.push(dateTo); }
 
     sql += ' GROUP BY t.category ORDER BY total DESC';
     const rows = await prisma.$queryRawUnsafe(sql, ...params);
@@ -339,7 +671,8 @@ router.get('/analysis/categories', async (req: Request, res: Response) => {
 router.get('/analysis/summary', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { account_id, include_savings } = req.query as Record<string, string>;
+    const { account_id, include_savings, group_id } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
     let sql = `
       SELECT
         COUNT(*) as total_transactions,
@@ -352,7 +685,7 @@ router.get('/analysis/summary', async (req: Request, res: Response) => {
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     sql += excludeTransfersSql(params, userId);
 
     const totals: any[] = await prisma.$queryRawUnsafe(sql, ...params);
@@ -420,12 +753,18 @@ router.patch('/accounts/:id', async (req: Request, res: Response) => {
     const existing = await prisma.bankAccount.findFirst({ where: { id, userId } });
     if (!existing) return res.status(404).json({ error: 'Konto nicht gefunden' });
 
-    const { name, account_type, bank, is_active } = req.body;
+    const { name, account_type, bank, is_active, iban, account_number, bic, holder, currency, notes } = req.body;
     const data: any = {};
     if (name !== undefined) data.name = name;
     if (account_type !== undefined) data.account_type = account_type;
     if (bank !== undefined) data.bank = bank;
     if (is_active !== undefined) data.is_active = is_active;
+    if (iban !== undefined) data.iban = iban || null;
+    if (account_number !== undefined) data.account_number = account_number || null;
+    if (bic !== undefined) data.bic = bic || null;
+    if (holder !== undefined) data.holder = holder || null;
+    if (currency !== undefined) data.currency = currency;
+    if (notes !== undefined) data.notes = notes || null;
 
     const account = await prisma.bankAccount.update({ where: { id }, data });
     res.json(account);
@@ -444,6 +783,164 @@ router.delete('/accounts/:id', async (req: Request, res: Response) => {
 
     await prisma.transaction.deleteMany({ where: { account_id: id } });
     await prisma.bankAccount.delete({ where: { id } });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== Account Groups CRUD ====================
+
+// List all groups with member accounts and transaction counts
+router.get('/account-groups', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const groups = await prisma.accountGroup.findMany({
+      where: { userId },
+      include: { accounts: true },
+      orderBy: { name: 'asc' },
+    });
+
+    // Gather tx counts for all accounts in groups
+    const allAccountIds = groups.flatMap(g => g.accounts.map(a => a.id));
+    let txCounts: Record<number, number> = {};
+    if (allAccountIds.length > 0) {
+      const rows: any[] = await prisma.$queryRawUnsafe(
+        `SELECT account_id, COUNT(*) as count FROM transactions WHERE account_id IN (${allAccountIds.map(() => '?').join(',')}) GROUP BY account_id`,
+        ...allAccountIds,
+      );
+      for (const r of rows) txCounts[Number(r.account_id)] = Number(r.count);
+    }
+
+    res.json(groups.map(g => ({
+      id: g.id,
+      name: g.name,
+      account_type: g.account_type,
+      is_active: g.is_active,
+      accounts: g.accounts.map(a => ({
+        id: a.id,
+        name: a.name,
+        bank: a.bank,
+        iban: a.iban,
+        account_type: a.account_type,
+        transaction_count: txCounts[a.id] || 0,
+      })),
+      transaction_count: g.accounts.reduce((sum, a) => sum + (txCounts[a.id] || 0), 0),
+    })));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create a new group
+router.post('/account-groups', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const { name, accountIds, account_type } = req.body;
+    if (!name) return res.status(400).json({ error: 'Name erforderlich' });
+
+    const groupData: any = { name, userId };
+    if (account_type) groupData.account_type = account_type;
+
+    const group = await prisma.accountGroup.create({ data: groupData });
+
+    if (accountIds?.length) {
+      const memberData: any = { group_id: group.id };
+      if (group.account_type) memberData.account_type = group.account_type;
+      memberData.is_active = group.is_active;
+      await prisma.bankAccount.updateMany({
+        where: { id: { in: accountIds }, userId },
+        data: memberData,
+      });
+    }
+
+    res.json(group);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Rename a group
+router.patch('/account-groups/:id', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+    const { name, account_type, is_active } = req.body;
+
+    const group = await prisma.accountGroup.findFirst({ where: { id, userId } });
+    if (!group) return res.status(404).json({ error: 'Gruppe nicht gefunden' });
+
+    const data: any = {};
+    if (name !== undefined) data.name = name;
+    if (account_type !== undefined) data.account_type = account_type;
+    if (is_active !== undefined) data.is_active = is_active;
+
+    const updated = await prisma.accountGroup.update({ where: { id }, data });
+
+    // Cascade type/active changes to member accounts
+    if (account_type !== undefined || is_active !== undefined) {
+      const memberData: any = {};
+      if (account_type !== undefined) memberData.account_type = account_type;
+      if (is_active !== undefined) memberData.is_active = is_active;
+      await prisma.bankAccount.updateMany({ where: { group_id: id }, data: memberData });
+    }
+
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a group (accounts preserved, ungrouped via SetNull)
+router.delete('/account-groups/:id', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+
+    const group = await prisma.accountGroup.findFirst({ where: { id, userId } });
+    if (!group) return res.status(404).json({ error: 'Gruppe nicht gefunden' });
+
+    // Ungroup accounts first, then delete group
+    await prisma.bankAccount.updateMany({ where: { group_id: id }, data: { group_id: null } });
+    await prisma.accountGroup.delete({ where: { id } });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Assign accounts to a group
+router.post('/account-groups/:id/accounts', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const id = parseInt(req.params.id as string);
+    const { accountIds } = req.body;
+    if (!accountIds?.length) return res.status(400).json({ error: 'accountIds erforderlich' });
+
+    const group = await prisma.accountGroup.findFirst({ where: { id, userId } });
+    if (!group) return res.status(404).json({ error: 'Gruppe nicht gefunden' });
+
+    await prisma.bankAccount.updateMany({
+      where: { id: { in: accountIds }, userId },
+      data: { group_id: id, account_type: group.account_type, is_active: group.is_active },
+    });
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Remove a single account from a group
+router.delete('/account-groups/:id/accounts/:accountId', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const groupId = parseInt(req.params.id as string);
+    const accountId = parseInt(req.params.accountId as string);
+
+    const account = await prisma.bankAccount.findFirst({ where: { id: accountId, group_id: groupId, userId } });
+    if (!account) return res.status(404).json({ error: 'Konto nicht in Gruppe gefunden' });
+
+    await prisma.bankAccount.update({ where: { id: accountId }, data: { group_id: null } });
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -541,7 +1038,8 @@ router.delete('/category-rules/:id', async (req: Request, res: Response) => {
 router.get('/categories/overview', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { year, month, account_id, include_savings } = req.query as Record<string, string>;
+    const { year, month, account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     const allCats = await prisma.category.findMany({ where: { userId }, orderBy: { name: 'asc' } });
 
@@ -556,9 +1054,11 @@ router.get('/categories/overview', async (req: Request, res: Response) => {
       WHERE 1=1
     `;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
     if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
+    if (dateFrom) { sql += ` AND t.bu_date >= ?`; params.push(dateFrom); }
+    if (dateTo) { sql += ` AND t.bu_date <= ?`; params.push(dateTo); }
     sql += ' GROUP BY t.category';
 
     const txStatsRaw: any[] = await prisma.$queryRawUnsafe(sql, ...params);
@@ -821,7 +1321,7 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
       description: tx.description || '',
       category,
       sampleDescriptions: samples.map((s: any) => `${s.counterparty}: ${s.description}`),
-    });
+    }, userId);
 
     res.json(result);
   } catch (err: any) {
@@ -831,8 +1331,8 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
 
     let explanation = 'KI-Vorschlag fehlgeschlagen – Fallback auf einfaches Stichwort.';
     const msg = err.message || '';
-    if (msg.includes('not configured')) {
-      explanation = 'OPENROUTER_API_KEY nicht konfiguriert. Bitte in .env setzen.';
+    if (msg.includes('API-Key')) {
+      explanation = 'Kein OpenRouter API-Key konfiguriert. Bitte in den Einstellungen hinterlegen.';
     } else if (msg.includes('403') || msg.includes('limit')) {
       explanation = 'OpenRouter API-Limit erreicht. Bitte Limit unter openrouter.ai/settings/keys erhöhen.';
     } else if (msg.includes('401')) {
@@ -854,7 +1354,8 @@ router.post('/ai/suggest-pattern', async (req: Request, res: Response) => {
 router.post('/ai/batch-groups', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { limit = 50, year, month, account_id, include_savings } = req.body || {};
+    const { limit = 50, year, month, account_id, include_savings, group_id } = req.body || {};
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     const catRows = await prisma.category.findMany({
       where: { NOT: { name: 'Sonstiges' }, userId },
@@ -866,7 +1367,7 @@ router.post('/ai/batch-groups', async (req: Request, res: Response) => {
        FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id
        WHERE t.category = 'Sonstiges'`;
     const params: any[] = [];
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     if (year) { sql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
     if (month) { sql += ` AND strftime('%m', t.bu_date) = ?`; params.push(String(month).padStart(2, '0')); }
     sql += ' ORDER BY t.bu_date DESC';
@@ -912,15 +1413,16 @@ router.post('/ai/batch-groups', async (req: Request, res: Response) => {
   }
 });
 
-// Step 2: Categorize a single group (one AI call)
+// Step 2: Categorize multiple groups in one AI call (true batching)
 router.post('/ai/batch-categorize', async (req: Request, res: Response) => {
   try {
-    const { group, existing_categories } = req.body as {
-      group: CounterpartyGroup;
+    const userId = getUserId(req);
+    const { groups, existing_categories } = req.body as {
+      groups: CounterpartyGroup[];
       existing_categories: string[];
     };
-    const suggestion = await categorizeGroup(group, existing_categories);
-    res.json(suggestion);
+    const suggestions = await categorizeGroups(groups, existing_categories, userId);
+    res.json(suggestions);
   } catch (err: any) {
     console.error('Batch categorize error:', err.message || err);
     const status = err.message?.includes('nicht konfiguriert') ? 400 : 500;
@@ -959,25 +1461,31 @@ router.post('/ai/batch-apply', async (req: Request, res: Response) => {
         updatedTransactions += result;
       }
 
-      if (action.create_rule && action.rule) {
+      if (action.create_rule) {
+        const rule = action.rule || {
+          pattern: action.counterparty || '',
+          match_type: 'keyword',
+          match_field: 'counterparty',
+        };
+        if (!rule.pattern) continue;
         const existing = await prisma.categoryRule.findFirst({
           where: {
-            pattern: action.rule.pattern,
-            match_field: action.rule.match_field,
+            pattern: rule.pattern,
+            match_field: rule.match_field,
             category: action.category,
             userId,
           },
         });
         if (!existing) {
-          if (action.rule.match_type === 'regex') {
-            try { new RegExp(action.rule.pattern); } catch { continue; }
+          if (rule.match_type === 'regex') {
+            try { new RegExp(rule.pattern); } catch { continue; }
           }
           await prisma.categoryRule.create({
             data: {
               category: action.category,
-              pattern: action.rule.pattern,
-              match_field: action.rule.match_field || 'counterparty',
-              match_type: action.rule.match_type || 'keyword',
+              pattern: rule.pattern,
+              match_field: rule.match_field || 'counterparty',
+              match_type: rule.match_type || 'keyword',
               priority: 100,
               is_default: false,
               created_at: new Date().toISOString(),
@@ -996,26 +1504,68 @@ router.post('/ai/batch-apply', async (req: Request, res: Response) => {
   }
 });
 
-// ── AI Template Generation ──────────────────────────────────────────
 
-router.post('/ai/generate-template', async (req: Request, res: Response) => {
+// ── OpenRouter API Key (user-scoped) ─────────────────────────────────
+
+router.get('/settings/api-key', async (req: Request, res: Response) => {
   try {
-    let { csvSample } = req.body as { csvSample: string };
-    if (!csvSample || typeof csvSample !== 'string' || csvSample.trim().length < 10) {
-      res.status(400).json({ error: 'CSV-Daten zu kurz oder fehlen.' });
-      return;
-    }
-    const lines = csvSample.split('\n').slice(0, 50);
-    csvSample = lines.join('\n').slice(0, 10_000);
-
-    const config = await generateTemplateConfig(csvSample);
-    res.json({ config });
+    const userId = getUserId(req);
+    const apiKey = await getApiKeyForUser(userId);
+    // Return masked key for display (show last 4 chars)
+    const masked = apiKey ? '•'.repeat(Math.max(0, apiKey.length - 4)) + apiKey.slice(-4) : '';
+    res.json({ hasKey: !!apiKey, maskedKey: masked });
   } catch (err: any) {
-    const isNoKey = err.message?.includes('OPENROUTER_API_KEY');
-    res.status(isNoKey ? 400 : 500).json({
-      error: err.message,
-      code: isNoKey ? 'NO_API_KEY' : undefined,
-    });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/settings/api-key', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const { apiKey } = req.body;
+    if (!apiKey || typeof apiKey !== 'string' || !apiKey.trim().startsWith('sk-')) {
+      return res.status(400).json({ error: 'Ungültiger API-Key. OpenRouter Keys beginnen mit "sk-".' });
+    }
+    await upsertSetting('openrouter_api_key', apiKey.trim(), userId);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/settings/api-key', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const existing = await prisma.setting.findFirst({ where: { key: 'openrouter_api_key', userId } });
+    if (existing) {
+      await prisma.setting.delete({ where: { id: existing.id } });
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI Import Consent Setting ────────────────────────────────────────
+
+router.get('/settings/ai-import', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const setting = await prisma.setting.findFirst({ where: { key: 'ai_import_allowed', userId } });
+    res.json({ allowed: setting?.value === 'true' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/settings/ai-import', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const { allowed } = req.body as { allowed: boolean };
+    await upsertSetting('ai_import_allowed', String(!!allowed), userId);
+    res.json({ success: true, allowed: !!allowed });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1024,11 +1574,12 @@ router.post('/ai/generate-template', async (req: Request, res: Response) => {
 router.get('/settings/ai-model', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
+    const apiKey = await getApiKeyForUser(userId);
     const [setting, customModels, zdrIds, availableIds] = await Promise.all([
       prisma.setting.findFirst({ where: { key: 'ai_model', userId } }),
       prisma.setting.findFirst({ where: { key: 'custom_models', userId } }),
       fetchZdrModelIds().catch(() => new Set<string>()),
-      fetchAvailableModelIds(),
+      fetchAvailableModelIds(apiKey),
     ]);
     const custom: string[] = customModels?.value ? JSON.parse(customModels.value) : [];
     res.json({
@@ -1036,7 +1587,7 @@ router.get('/settings/ai-model', async (req: Request, res: Response) => {
       presets: PRESET_MODELS,
       freeModel: FREE_MODEL,
       custom,
-      hasApiKey: hasApiKey(),
+      hasApiKey: !!apiKey,
       zdrModelIds: [...zdrIds],
       availableModelIds: [...availableIds],
     });
@@ -1059,9 +1610,11 @@ router.patch('/settings/ai-model', async (req: Request, res: Response) => {
   }
 });
 
-router.get('/settings/ai-model/browse', async (_req: Request, res: Response) => {
+router.get('/settings/ai-model/browse', async (req: Request, res: Response) => {
   try {
-    const result = await fetchAllModels();
+    const userId = getUserId(req);
+    const apiKey = await getApiKeyForUser(userId);
+    const result = await fetchAllModels(apiKey);
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -1106,14 +1659,17 @@ router.delete('/settings/ai-model/custom', async (req: Request, res: Response) =
 router.get('/analysis/flow', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { year, month, account_id, include_savings } = req.query as Record<string, string>;
+    const { year, month, account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     let baseSql = ' WHERE 1=1';
     const params: any[] = [];
-    baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
+    baseSql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     baseSql += excludeTransfersSql(params, userId);
     if (year) { baseSql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
     if (month) { baseSql += ` AND strftime('%m', t.bu_date) = ?`; params.push(month.padStart(2, '0')); }
+    if (dateFrom) { baseSql += ` AND t.bu_date >= ?`; params.push(dateFrom); }
+    if (dateTo) { baseSql += ` AND t.bu_date <= ?`; params.push(dateTo); }
 
     const incomeByIban: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.counterparty_iban as group_key, MIN(t.counterparty) as label, CAST(SUM(t.amount) AS REAL) as total
@@ -1189,17 +1745,25 @@ router.get('/analysis/flow', async (req: Request, res: Response) => {
 router.get('/analysis/daily', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { year, account_id, include_savings } = req.query as Record<string, string>;
+    const { year, account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
     const targetYear = year || String(new Date().getFullYear());
 
     let sql = `
       SELECT t.bu_date as day, CAST(SUM(t.amount) AS REAL) as value
       FROM transactions t
       INNER JOIN bank_accounts a ON t.account_id = a.id
-      WHERE t.direction = 'debit' AND strftime('%Y', t.bu_date) = ?
+      WHERE t.direction = 'debit'
     `;
-    const params: any[] = [targetYear];
-    sql += accountFilterSql(params, { account_id, include_savings }, userId);
+    const params: any[] = [];
+    if (dateFrom && dateTo) {
+      sql += ` AND t.bu_date >= ? AND t.bu_date <= ?`;
+      params.push(dateFrom, dateTo);
+    } else {
+      sql += ` AND strftime('%Y', t.bu_date) = ?`;
+      params.push(targetYear);
+    }
+    sql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     sql += excludeTransfersSql(params, userId);
     sql += ' GROUP BY t.bu_date ORDER BY t.bu_date ASC';
 
@@ -1214,13 +1778,16 @@ router.get('/analysis/daily', async (req: Request, res: Response) => {
 router.get('/analysis/category-monthly', async (req: Request, res: Response) => {
   try {
     const userId = getUserId(req);
-    const { year, account_id, include_savings } = req.query as Record<string, string>;
+    const { year, account_id, include_savings, group_id, dateFrom, dateTo } = req.query as Record<string, string>;
+    const account_ids = await resolveAccountIds({ group_id }, userId);
 
     let baseSql = ' WHERE t.direction = \'debit\'';
     const params: any[] = [];
-    baseSql += accountFilterSql(params, { account_id, include_savings }, userId);
+    baseSql += accountFilterSql(params, { account_id, account_ids, include_savings }, userId);
     baseSql += excludeTransfersSql(params, userId);
     if (year) { baseSql += ` AND strftime('%Y', t.bu_date) = ?`; params.push(year); }
+    if (dateFrom) { baseSql += ` AND t.bu_date >= ?`; params.push(dateFrom); }
+    if (dateTo) { baseSql += ` AND t.bu_date <= ?`; params.push(dateTo); }
 
     const topCats: any[] = await prisma.$queryRawUnsafe(
       `SELECT t.category, CAST(SUM(t.amount) AS REAL) as total
@@ -1293,7 +1860,23 @@ router.get('/bank-templates', async (req: Request, res: Response) => {
   const templates = await prisma.bankTemplate.findMany({
     where: { OR: [{ userId }, { is_builtin: true }] },
   });
-  res.json(templates.map(t => ({ ...t, config: JSON.parse(t.config) })));
+
+  // Enrich with usage stats: count transactions imported via each bank account
+  const accounts = await prisma.bankAccount.findMany({
+    where: { userId },
+    select: { id: true, bank: true, name: true, _count: { select: { transactions: true } } },
+  });
+
+  res.json(templates.map(t => {
+    const parsed = JSON.parse(t.config);
+    // Match accounts by template name (AI templates are named "BankName (KI-generiert)")
+    const templateBankName = t.name.replace(/\s*\(KI-generiert\)$/, '').trim();
+    const matchedAccounts = accounts
+      .filter(a => a.bank === templateBankName || a.bank === t.name || a.name.includes(templateBankName))
+      .map(a => ({ name: a.name, bank: a.bank, txCount: a._count.transactions }));
+    const txCount = matchedAccounts.reduce((sum, a) => sum + a.txCount, 0);
+    return { ...t, config: parsed, matchedAccounts, txCount };
+  }));
 });
 
 router.get('/bank-templates/:id', async (req: Request, res: Response) => {
@@ -1306,7 +1889,7 @@ router.get('/bank-templates/:id', async (req: Request, res: Response) => {
 
 router.post('/bank-templates', async (req: Request, res: Response) => {
   const userId = getUserId(req);
-  const { id, name, config } = req.body;
+  const { id, name, config, is_ai_generated } = req.body;
   if (!id || !name || !config) { res.status(400).json({ error: 'id, name, config required' }); return; }
   const template = await prisma.bankTemplate.create({
     data: {
@@ -1314,6 +1897,7 @@ router.post('/bank-templates', async (req: Request, res: Response) => {
       name,
       config: JSON.stringify(config),
       is_builtin: false,
+      is_ai_generated: is_ai_generated || false,
       enabled: true,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -1330,11 +1914,10 @@ router.patch('/bank-templates/:id', async (req: Request, res: Response) => {
   const existing = await prisma.bankTemplate.findFirst({ where: { id, OR: [{ userId }, { is_builtin: true }] } });
   if (!existing) { res.status(404).json({ error: 'Template not found' }); return; }
 
-  const { name, config, enabled } = req.body;
+  const { name, config } = req.body;
   const data: any = { updated_at: new Date().toISOString() };
   if (name !== undefined) data.name = name;
   if (config !== undefined) data.config = JSON.stringify(config);
-  if (enabled !== undefined) data.enabled = enabled;
   const template = await prisma.bankTemplate.update({ where: { id }, data });
   invalidateTemplateCache();
   res.json({ ...template, config: JSON.parse(template.config) });
@@ -1363,51 +1946,81 @@ router.post('/bank-templates/test', async (req: Request, res: Response) => {
   }
 });
 
-// ── Reset: Delete current user's data and re-seed defaults ───────────
-router.delete('/reset', async (req: Request, res: Response) => {
-  const userId = getUserId(req);
+// ── Reset helpers ────────────────────────────────────────────────────
 
-  // Delete user's transactions (through their bank accounts)
+async function deleteAllUserTransactions(userId: string) {
   const userAccountIds = (await prisma.bankAccount.findMany({ where: { userId }, select: { id: true } })).map(a => a.id);
   if (userAccountIds.length > 0) {
     await prisma.transaction.deleteMany({ where: { account_id: { in: userAccountIds } } });
   }
-
   await prisma.importLog.deleteMany({ where: { userId } });
+}
+
+async function deleteAllUserAccounts(userId: string) {
+  await deleteAllUserTransactions(userId);
   await prisma.bankAccount.deleteMany({ where: { userId } });
+  await prisma.accountGroup.deleteMany({ where: { userId } });
+}
+
+async function deleteAllUserData(userId: string) {
+  await deleteAllUserAccounts(userId);
   await prisma.categoryRule.deleteMany({ where: { userId } });
   await prisma.category.deleteMany({ where: { userId } });
   await prisma.bankTemplate.deleteMany({ where: { userId, is_builtin: false } });
+  await prisma.setting.deleteMany({ where: { userId } });
+}
 
-  // Re-seed default categories for this user
-  for (const cat of DEFAULT_CATEGORIES) {
-    await prisma.category.create({
-      data: { name: cat.name, is_default: true, category_type: cat.type, userId, created_at: new Date().toISOString() },
-    });
+// ── Reset: Transactions ──────────────────────────────────────────────
+router.post('/reset/transactions', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    await deleteAllUserTransactions(userId);
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Reset transactions error:', err);
+    res.status(500).json({ error: err.message });
   }
+});
 
-  // Re-seed default category rules for this user
-  for (let i = 0; i < DEFAULT_RULES.length; i++) {
-    const rule = DEFAULT_RULES[i];
-    await prisma.categoryRule.create({
-      data: {
-        category: rule.category,
-        pattern: rule.pattern,
-        match_field: 'description',
-        match_type: 'regex',
-        priority: (i + 1) * 10,
-        is_default: true,
-        userId,
-        created_at: new Date().toISOString(),
-      },
-    });
+// ── Reset: Accounts (+ transactions) ────────────────────────────────
+router.post('/reset/accounts', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    await deleteAllUserAccounts(userId);
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Reset accounts error:', err);
+    res.status(500).json({ error: err.message });
   }
+});
 
-  // Re-seed builtin bank templates (global, not user-scoped)
-  await ensureBuiltinTemplates();
-  invalidateTemplateCache();
+// ── Reset: Templates ────────────────────────────────────────────────
+router.post('/reset/templates', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    await prisma.bankTemplate.deleteMany({ where: { userId, is_builtin: false } });
+    invalidateTemplateCache();
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Reset templates error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
-  res.json({ ok: true });
+// ── Delete Account: Remove all user data and the user itself ─────────
+router.delete('/account', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    await deleteAllUserData(userId);
+
+    // Delete the user record (cascades to sessions, accounts, passkeys)
+    await prisma.user.delete({ where: { id: userId } });
+
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error('Delete account error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

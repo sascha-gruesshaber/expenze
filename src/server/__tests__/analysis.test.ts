@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { createTestApp, api, cleanDatabase, seedAccount, seedTransaction, seedCategory } from './helpers.js';
+import { prisma } from '../prisma.js';
 
 beforeAll(async () => { await createTestApp(); });
 beforeEach(async () => { await cleanDatabase(); });
@@ -103,5 +104,28 @@ describe('GET /api/analysis/category-monthly', () => {
     expect(jan).toBeDefined();
     expect(jan.categories).toBeDefined();
     expect(jan.categories['Lebensmittel']).toBe(80);
+  });
+});
+
+describe('Filter by account group', () => {
+  it('summary filters by group_id', async () => {
+    await seedCategory('Sonstiges');
+    const a1 = await seedAccount({ name: 'Alt' });
+    const a2 = await seedAccount({ name: 'Neu', iban: 'DE11111111111111111111' });
+    const a3 = await seedAccount({ name: 'Fremd', iban: 'DE33333333333333333333' });
+
+    await seedTransaction(a1.id, { amount: 100, direction: 'debit' });
+    await seedTransaction(a2.id, { amount: 200, direction: 'debit' });
+    await seedTransaction(a3.id, { amount: 500, direction: 'debit' });
+
+    // Create a group with a1 and a2
+    const group = await prisma.accountGroup.create({ data: { name: 'Merged', userId: 'test-user-id' } });
+    await prisma.bankAccount.updateMany({ where: { id: { in: [a1.id, a2.id] } }, data: { group_id: group.id } });
+
+    const res = await api().get(`/api/analysis/summary?group_id=${group.id}`);
+    expect(res.status).toBe(200);
+    // Should only include a1 (100) + a2 (200), not a3 (500)
+    expect(res.body.stats.total_transactions).toBe(2);
+    expect(res.body.stats.total_expenses).toBe(300);
   });
 });

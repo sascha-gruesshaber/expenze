@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { prisma } from './prisma.js';
 import { Prisma } from '../generated/prisma/client.js';
-import { categorizeWithRules, computeHash, type DbCategoryRule, type ParsedTransaction } from './parsers/types.js';
+import { categorizeWithRules, computeHash, type DbCategoryRule, type ParsedTransaction, type BankTemplateConfig } from './parsers/types.js';
 
 export interface ImportProgress {
   id: string;
@@ -16,7 +16,56 @@ export interface ImportProgress {
   bank: string;
 }
 
-// In-memory job tracker — auto-purge entries older than 1 hour
+// ── Preview cache ────────────────────────────────────────────────────
+
+export interface ImportPreview {
+  id: string;
+  filename: string;
+  transactions: ParsedTransaction[];
+  bank: string;
+  saldoWarning?: string;
+  startBalance?: number;
+  endBalance?: number;
+  pdfBuffer?: Buffer;
+  generatedConfig?: { config: BankTemplateConfig; bankName: string };
+  createdAt: number;
+}
+
+const previewCache = new Map<string, ImportPreview>();
+const PREVIEW_TTL = 30 * 60 * 1000; // 30 minutes
+
+function purgeOldPreviews() {
+  const cutoff = Date.now() - PREVIEW_TTL;
+  for (const [id, preview] of previewCache) {
+    if (preview.createdAt < cutoff) previewCache.delete(id);
+  }
+}
+
+export function createPreview(
+  filename: string,
+  transactions: ParsedTransaction[],
+  bank: string,
+  saldoWarning?: string,
+  startBalance?: number,
+  endBalance?: number,
+  pdfBuffer?: Buffer,
+  generatedConfig?: { config: BankTemplateConfig; bankName: string },
+): string {
+  purgeOldPreviews();
+  const id = crypto.randomUUID();
+  previewCache.set(id, { id, filename, transactions, bank, saldoWarning, startBalance, endBalance, pdfBuffer, generatedConfig, createdAt: Date.now() });
+  return id;
+}
+
+export function getPreview(id: string): ImportPreview | undefined {
+  return previewCache.get(id);
+}
+
+export function deletePreview(id: string): void {
+  previewCache.delete(id);
+}
+
+// ── In-memory job tracker — auto-purge entries older than 1 hour ────
 const importJobs = new Map<string, ImportProgress & { createdAt: number }>();
 
 function purgeOldJobs() {

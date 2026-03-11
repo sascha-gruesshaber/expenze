@@ -143,11 +143,6 @@ export function BatchCategorizationDialog() {
         transaction_ids: s.transaction_ids,
         category: row.category,
         create_rule: row.createRule,
-        rule: row.createRule ? {
-          pattern: s.rule_pattern,
-          match_type: s.rule_match_type,
-          match_field: s.rule_match_field,
-        } : undefined,
       });
     }
 
@@ -460,9 +455,6 @@ export function BatchCategorizationDialog() {
                               Regel
                             </label>
                           </div>
-                          {s.explanation && (
-                            <p className="text-[11px] text-text-3 mt-1.5 italic">{s.explanation}</p>
-                          )}
                         </div>
                       </div>
                     </div>

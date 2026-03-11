@@ -22,7 +22,8 @@ export function SpendingCalendar() {
   const maxValue = Math.max(...data.map(d => d.value), 1);
 
   return (
-    <div className="h-[200px]">
+    <div className="overflow-x-auto -mx-4 md:mx-0 px-4 md:px-0">
+    <div className="h-[200px] min-w-[700px]">
       <ResponsiveCalendar
         data={data}
         theme={nivoTheme}
@@ -47,6 +48,7 @@ export function SpendingCalendar() {
           </div>
         )}
       />
+    </div>
     </div>
   );
 }

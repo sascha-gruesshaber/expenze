@@ -38,34 +38,25 @@ function CategoriesPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-start justify-between">
-        <div>
-          <h1 className="font-heading font-bold text-[20px] text-text">Kategorien & Regeln</h1>
-          <p className="text-[13px] text-text-3 mt-1">
-            Hier siehst du alle Kategorien mit ihren Buchungen und kannst Regeln für die automatische Zuordnung verwalten.
-            Regeln werden beim PDF-Import auf neue Transaktionen angewendet — per Regex oder Stichwort auf Beschreibung, Empfänger oder beides.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 shrink-0 ml-4">
-          <button
-            onClick={() => setShowCreate(true)}
-            className="px-4 py-2 text-[13px] font-medium text-text bg-surface border border-border rounded-lg hover:bg-surface-2/50 transition-colors inline-flex items-center gap-2"
-          >
-            <Plus size={14} />
-            Neue Kategorie
-          </button>
-          <button
-            onClick={openDialog}
-            disabled={sonstigesCount === 0}
-            className="px-4 py-2 text-[13px] font-medium text-white bg-accent rounded-lg hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-2"
-          >
-            <Sparkles size={14} />
-            KI-Kategorisierung
-            {sonstigesCount > 0 && (
-              <span className="bg-white/20 px-1.5 py-0.5 rounded text-[11px]">{sonstigesCount}</span>
-            )}
-          </button>
-        </div>
+      <div className="mb-5 flex items-center justify-between gap-3 flex-wrap">
+        <button
+          onClick={() => setShowCreate(true)}
+          className="px-4 py-2 text-[13px] font-medium text-text bg-surface border border-border rounded-xl hover:bg-surface-2/50 transition-colors inline-flex items-center gap-2"
+        >
+          <Plus size={14} />
+          Neue Kategorie
+        </button>
+        <button
+          onClick={openDialog}
+          disabled={sonstigesCount === 0}
+          className="px-4 py-2 text-[13px] font-medium text-white bg-accent rounded-xl hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-2"
+        >
+          <Sparkles size={14} />
+          KI-Kategorisierung
+          {sonstigesCount > 0 && (
+            <span className="bg-white/20 px-1.5 py-0.5 rounded text-[11px]">{sonstigesCount}</span>
+          )}
+        </button>
       </div>
 
       {showCreate && (

@@ -129,41 +129,45 @@ export function BatchCategoryProvider({ children }: { children: ReactNode }) {
         totalTransactions: total_transactions,
       }));
 
-      for (let i = 0; i < groups.length; i++) {
+      const CHUNK_SIZE = 25;
+      let completedSoFar = 0;
+
+      for (let ci = 0; ci < groups.length; ci += CHUNK_SIZE) {
         if (abort.signal.aborted) return;
 
-        const group = groups[i];
-        setProgress(p => ({ ...p, currentGroup: group.counterparty }));
+        const chunk = groups.slice(ci, ci + CHUNK_SIZE);
+        const chunkIndex = Math.floor(ci / CHUNK_SIZE) + 1;
+        const totalChunks = Math.ceil(groups.length / CHUNK_SIZE);
+
+        setProgress(p => ({ ...p, currentGroup: `Batch ${chunkIndex}/${totalChunks} (${chunk.length} Gruppen)` }));
 
         try {
-          const suggestion = await apiPost<BatchSuggestion>('/ai/batch-categorize', {
-            group,
+          const suggestions = await apiPost<BatchSuggestion[]>('/ai/batch-categorize', {
+            groups: chunk,
             existing_categories,
           });
           if (abort.signal.aborted) return;
+          completedSoFar += chunk.length;
           setProgress(p => ({
             ...p,
-            suggestions: [...p.suggestions, suggestion],
-            completed: i + 1,
+            suggestions: [...p.suggestions, ...suggestions],
+            completed: completedSoFar,
           }));
         } catch (err: any) {
           if (abort.signal.aborted) return;
-          const fallback: BatchSuggestion = {
-            counterparty: group.counterparty,
-            transaction_ids: group.transaction_ids,
+          const fallbacks: BatchSuggestion[] = chunk.map(g => ({
+            counterparty: g.counterparty,
+            transaction_ids: g.transaction_ids,
             suggested_category: 'Sonstiges',
             is_new_category: false,
-            confidence: 'low',
-            rule_pattern: group.counterparty || '',
-            rule_match_type: 'keyword',
-            rule_match_field: 'counterparty',
-            explanation: `Fehler: ${err.message}`,
-            count: group.count,
-          };
+            confidence: 'low' as const,
+            count: g.count,
+          }));
+          completedSoFar += chunk.length;
           setProgress(p => ({
             ...p,
-            suggestions: [...p.suggestions, fallback],
-            completed: i + 1,
+            suggestions: [...p.suggestions, ...fallbacks],
+            completed: completedSoFar,
           }));
         }
       }

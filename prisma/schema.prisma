@@ -22,6 +22,7 @@ model User {
   accounts      Account[]
   passkeys      Passkey[]
   bankAccounts  BankAccount[]
+  accountGroups AccountGroup[]
   categories    Category[]
   categoryRules CategoryRule[]
   bankTemplates BankTemplate[]
@@ -93,17 +94,36 @@ model Passkey {
 
 // ── App Models ──────────────────────────────────────────────────────
 
+model AccountGroup {
+  id           Int           @id @default(autoincrement())
+  name         String
+  account_type String        @default("checking")
+  is_active    Boolean       @default(true)
+  userId       String
+  user         User?         @relation(fields: [userId], references: [id])
+  accounts     BankAccount[]
+
+  @@index([userId])
+  @@map("account_groups")
+}
+
 model BankAccount {
   id             Int           @id @default(autoincrement())
   name           String
   iban           String?
   account_number String?
+  bic            String?
   bank           String
+  holder         String?
   account_type   String        @default("checking")
   is_active      Boolean       @default(true)
+  currency       String        @default("EUR")
+  notes          String?
   created_at     String?
   userId         String?
   user           User?         @relation(fields: [userId], references: [id])
+  group_id       Int?
+  group          AccountGroup? @relation(fields: [group_id], references: [id], onDelete: SetNull)
   transactions   Transaction[]
 
   @@index([iban])
@@ -176,7 +196,8 @@ model BankTemplate {
   name       String
   version    Int     @default(1)
   config     String
-  is_builtin Boolean @default(false)
+  is_builtin     Boolean @default(false)
+  is_ai_generated Boolean @default(false)
   enabled    Boolean @default(true)
   created_at String?
   updated_at String?

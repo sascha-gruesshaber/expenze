@@ -33,12 +33,19 @@ function DashboardPage() {
   const { data: recentTx = [] } = useTransactions({ ...filters, limit: '10' });
 
   let filtered = monthly;
-  if (filters.year)
-    filtered = filtered.filter((r) => r.month?.startsWith(filters.year));
-  if (filters.month)
-    filtered = filtered.filter((r) =>
-      r.month?.endsWith(filters.month.padStart(2, '0')),
-    );
+  if (filters.dateFrom && filters.dateTo) {
+    filtered = filtered.filter((r) => {
+      if (!r.month) return false;
+      return r.month >= filters.dateFrom!.slice(0, 7) && r.month <= filters.dateTo!.slice(0, 7);
+    });
+  } else {
+    if (filters.year)
+      filtered = filtered.filter((r) => r.month?.startsWith(filters.year));
+    if (filters.month)
+      filtered = filtered.filter((r) =>
+        r.month?.endsWith(filters.month.padStart(2, '0')),
+      );
+  }
 
   const income = filtered.reduce((s, r) => s + (Number(r.income) || 0), 0);
   const expenses = filtered.reduce((s, r) => s + (Number(r.expenses) || 0), 0);
@@ -72,14 +79,16 @@ function DashboardPage() {
     prevCount = prevFiltered.reduce((s, r) => s + (Number(r.count) || 0), 0);
   }
 
-  const chartData = filters.year
-    ? monthly.filter((r) => r.month?.startsWith(filters.year))
-    : monthly;
+  const chartData = filters.dateFrom && filters.dateTo
+    ? filtered
+    : filters.year
+      ? monthly.filter((r) => r.month?.startsWith(filters.year))
+      : monthly;
 
   return (
     <div className="space-y-5">
       {/* Stat Cards */}
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <TrendStatCard
           label="Transaktionen"
           value={count || Number(summary?.stats?.total_transactions) || 0}
@@ -111,7 +120,7 @@ function DashboardPage() {
       </div>
 
       {/* Main Chart + Savings Ring */}
-      <div className="grid grid-cols-[1fr_280px] gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-4">
         <div className="bg-surface rounded-2xl shadow-card p-6">
           <div className="flex items-center justify-between mb-5">
             <div className="flex items-center gap-2.5">
@@ -136,7 +145,7 @@ function DashboardPage() {
       </div>
 
       {/* Categories + Insights + Recent */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
         <div className="bg-surface rounded-2xl shadow-card p-6">
           <div className="flex items-center justify-between mb-5">
             <span className="font-heading font-semibold text-[15px] text-text">

@@ -4,6 +4,8 @@ export interface FilterState {
   year: string;
   month: string;
   account: string; // account_id or '' for default (Girokonten), 'all' for all
+  dateFrom?: string; // YYYY-MM-DD
+  dateTo?: string;   // YYYY-MM-DD
 }
 
 export interface FilterContextValue {

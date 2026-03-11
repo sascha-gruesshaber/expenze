@@ -1,5 +1,6 @@
 import { CheckCircle2 } from 'lucide-react';
 import type { ImportResult } from '../../api/hooks';
+import { BankLogo } from '../BankLogo';
 
 interface ImportResultsProps {
   results: ImportResult[] | null;
@@ -19,9 +20,7 @@ export function ImportResults({ results }: ImportResultsProps) {
             <div className="flex items-center gap-2">
               <span className="font-medium text-[14px] text-text">{res.filename}</span>
               {res.bank && (
-                <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-accent/10 text-accent">
-                  {res.bank}
-                </span>
+                <BankLogo bank={res.bank} size={20} />
               )}
             </div>
             <div className="text-[12px] text-text-3 mt-0.5">

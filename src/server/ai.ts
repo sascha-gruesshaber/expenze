@@ -16,8 +16,16 @@ export const PRESET_MODELS = [
 
 export const FREE_MODEL = { id: 'openrouter/free', label: 'Kostenlos (Auto-Router)' };
 
-export function hasApiKey(): boolean {
-  return !!process.env.OPENROUTER_API_KEY;
+// ── Per-user API key ─────────────────────────────────────────────────
+
+export async function getApiKeyForUser(userId: string): Promise<string | null> {
+  const setting = await prisma.setting.findFirst({ where: { key: 'openrouter_api_key', userId } });
+  return setting?.value || null;
+}
+
+export async function hasApiKeyForUser(userId: string): Promise<boolean> {
+  const key = await getApiKeyForUser(userId);
+  return !!key;
 }
 
 // ── Dynamic model list from OpenRouter ──────────────────────────────
@@ -42,20 +50,20 @@ export interface BrowseModel {
   supportsZdr: boolean;
 }
 
-// ── Caches (1 hour TTL) ─────────────────────────────────────────────
+// ── Caches (1 hour TTL, keyed by API key) ────────────────────────────
 
 const CACHE_TTL = 60 * 60 * 1000;
 
-let rawModelsCache: { data: OpenRouterModel[]; ts: number } | null = null;
+const rawModelsCacheMap = new Map<string, { data: OpenRouterModel[]; ts: number }>();
 let zdrModelIdsCache: { data: Set<string>; ts: number } | null = null;
 
-async function fetchRawModels(): Promise<OpenRouterModel[]> {
-  if (rawModelsCache && Date.now() - rawModelsCache.ts < CACHE_TTL) {
-    return rawModelsCache.data;
+async function fetchRawModels(apiKey: string | null): Promise<OpenRouterModel[]> {
+  const cacheKey = apiKey || '__public__';
+  const cached = rawModelsCacheMap.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) {
+    return cached.data;
   }
 
-  // Use /models/user when API key is available — respects account privacy/ZDR settings
-  const apiKey = process.env.OPENROUTER_API_KEY;
   const headers: Record<string, string> = {};
   let url = `${OPENROUTER_BASE}/models`;
   if (apiKey) {
@@ -67,7 +75,7 @@ async function fetchRawModels(): Promise<OpenRouterModel[]> {
   if (!res.ok) throw new Error('OpenRouter models API unavailable');
   const { data } = await res.json() as { data: OpenRouterModel[] };
 
-  rawModelsCache = { data, ts: Date.now() };
+  rawModelsCacheMap.set(cacheKey, { data, ts: Date.now() });
   return data;
 }
 
@@ -94,9 +102,9 @@ async function isZdrSupported(model: string): Promise<boolean> {
   return ids.has(model);
 }
 
-export async function fetchAvailableModelIds(): Promise<Set<string>> {
+export async function fetchAvailableModelIds(apiKey: string | null): Promise<Set<string>> {
   try {
-    const models = await fetchRawModels();
+    const models = await fetchRawModels(apiKey);
     return new Set(models.map(m => m.id));
   } catch {
     return new Set();
@@ -112,8 +120,8 @@ function isTextCapable(m: OpenRouterModel): boolean {
   return true;
 }
 
-export async function fetchAllModels(): Promise<{ models: BrowseModel[]; providers: string[] }> {
-  const [data, zdrIds] = await Promise.all([fetchRawModels(), fetchZdrModelIds()]);
+export async function fetchAllModels(apiKey: string | null): Promise<{ models: BrowseModel[]; providers: string[] }> {
+  const [data, zdrIds] = await Promise.all([fetchRawModels(apiKey), fetchZdrModelIds()]);
 
   const models: BrowseModel[] = data
     .filter(m => {
@@ -144,11 +152,6 @@ export async function fetchAllModels(): Promise<{ models: BrowseModel[]; provide
 
   const providers = [...new Set(models.map(m => m.provider))].sort();
   return { models, providers };
-}
-
-async function getModel(): Promise<string> {
-  const setting = await prisma.setting.findFirst({ where: { key: 'ai_model' } });
-  return setting?.value || DEFAULT_MODEL;
 }
 
 export async function getModelForUser(userId: string): Promise<string> {
@@ -187,10 +190,6 @@ export interface BatchSuggestion {
   suggested_category: string;
   is_new_category: boolean;
   confidence: 'high' | 'medium' | 'low';
-  rule_pattern: string;
-  rule_match_type: 'keyword' | 'regex';
-  rule_match_field: 'counterparty' | 'description' | 'both';
-  explanation: string;
   count: number;
 }
 
@@ -242,81 +241,136 @@ async function callWithRetry(apiKey: string, model: string, prompt: string, zdr:
   throw new Error('Max retries exceeded');
 }
 
-function buildBatchPrompt(group: CounterpartyGroup, existingCategories: string[]): string {
-  const isDescription = !group.counterparty || group.counterparty.trim() === '';
-  const label = isDescription ? 'Beschreibung' : 'Empfänger';
-  const value = isDescription ? group.sample_descriptions[0]?.substring(0, 60) || 'unbekannt' : group.counterparty;
-  const direction = group.direction === 'credit' ? 'Einnahme' : 'Ausgabe';
+// ── Plain text AI call (for PDF conversion etc.) ────────────────────
+
+export async function callAiForText(prompt: string, userId: string): Promise<string> {
+  const apiKey = await getApiKeyForUser(userId);
+  if (!apiKey) {
+    throw new Error('OPENROUTER_API_KEY nicht konfiguriert. PDF-Import benötigt KI-Analyse.');
+  }
+
+  const model = await getModelForUser(userId);
+  const zdr = await isZdrSupported(model);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        ...(zdr ? { provider: { zdr: true } } : {}),
+      }),
+    });
+
+    if (res.status === 429 && attempt < 2) {
+      const delay = Math.pow(2, attempt) * 1000;
+      await new Promise(r => setTimeout(r, delay));
+      continue;
+    }
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`KI-Analyse fehlgeschlagen: ${res.status} ${text}`);
+    }
+
+    const data: any = await res.json();
+    const content = data.choices?.[0]?.message?.content || '';
+    if (!content) {
+      throw new Error('KI-Analyse fehlgeschlagen: Leere Antwort vom Modell.');
+    }
+    return content;
+  }
+  throw new Error('KI-Analyse fehlgeschlagen: Maximale Wiederholungen überschritten.');
+}
+
+function buildMultiGroupPrompt(groups: CounterpartyGroup[], existingCategories: string[]): string {
+  const groupEntries = groups.map((g, i) => {
+    const direction = g.direction === 'credit' ? 'Einnahme' : 'Ausgabe';
+    const label = (!g.counterparty || g.counterparty.trim() === '')
+      ? g.sample_descriptions[0]?.substring(0, 60) || 'unbekannt'
+      : g.counterparty;
+    return {
+      index: i,
+      name: label,
+      direction,
+      descriptions: g.sample_descriptions.slice(0, 3),
+      amounts: g.sample_amounts.slice(0, 3).map(a => a.toFixed(2) + ' €'),
+    };
+  });
 
   return `Du bist ein Experte für Banktransaktions-Kategorisierung.
 
 Vorhandene Kategorien (bevorzuge diese wenn passend):
 ${existingCategories.join(', ')}
 
-${label}: ${value}
-Richtung: ${direction}
-Beispiel-Beschreibungen:
-${group.sample_descriptions.map(d => `- ${d}`).join('\n')}
-Beispiel-Beträge: ${group.sample_amounts.map(a => a.toFixed(2) + ' €').join(', ')}
+Hier sind ${groups.length} Empfängergruppen. Kategorisiere jede einzeln:
+
+${JSON.stringify(groupEntries, null, 1)}
 
 Antworte NUR mit JSON:
-{
-  "category": "...",
-  "is_new": true/false,
-  "confidence": "high" | "medium" | "low",
-  "pattern": "...",
-  "match_type": "keyword" | "regex",
-  "match_field": "counterparty" | "description" | "both",
-  "explanation": "..."
-}`;
+{"results": [{"index": 0, "category": "...", "confidence": "high|medium|low"}, ...]}
+
+Regeln:
+- Verwende vorhandene Kategorien wenn möglich
+- "confidence" ist "high" bei eindeutigen Zuordnungen, "medium" bei wahrscheinlichen, "low" bei unsicheren
+- Antworte mit einem Ergebnis pro Gruppe, sortiert nach index`;
 }
 
-export async function categorizeGroup(
-  group: CounterpartyGroup,
+function makeFallback(group: CounterpartyGroup): BatchSuggestion {
+  return {
+    counterparty: group.counterparty,
+    transaction_ids: group.transaction_ids,
+    suggested_category: 'Sonstiges',
+    is_new_category: false,
+    confidence: 'low',
+    count: group.count,
+  };
+}
+
+export async function categorizeGroups(
+  groups: CounterpartyGroup[],
   existingCategories: string[],
-): Promise<BatchSuggestion> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  userId: string,
+): Promise<BatchSuggestion[]> {
+  const apiKey = await getApiKeyForUser(userId);
   if (!apiKey) {
-    throw new Error('OPENROUTER_API_KEY nicht konfiguriert. Bitte in .env setzen.');
+    throw new Error('Kein OpenRouter API-Key konfiguriert. Bitte in den Einstellungen hinterlegen.');
   }
 
-  const model = await getModel();
+  const model = await getModelForUser(userId);
   const zdr = await isZdrSupported(model);
 
   try {
-    const prompt = buildBatchPrompt(group, existingCategories);
+    const prompt = buildMultiGroupPrompt(groups, existingCategories);
     const parsed = await callWithRetry(apiKey, model, prompt, zdr);
 
-    const confidence = (['high', 'medium', 'low'].includes(parsed.confidence) ? parsed.confidence : 'low') as 'high' | 'medium' | 'low';
-    const matchField = (['counterparty', 'description', 'both'].includes(parsed.match_field) ? parsed.match_field : 'counterparty') as 'counterparty' | 'description' | 'both';
-    const matchType = (parsed.match_type === 'regex' ? 'regex' : 'keyword') as 'keyword' | 'regex';
+    const results: BatchSuggestion[] = groups.map(g => makeFallback(g));
 
-    return {
-      counterparty: group.counterparty,
-      transaction_ids: group.transaction_ids,
-      suggested_category: parsed.category || 'Sonstiges',
-      is_new_category: !existingCategories.includes(parsed.category),
-      confidence,
-      rule_pattern: parsed.pattern || group.counterparty || '',
-      rule_match_type: matchType,
-      rule_match_field: matchField,
-      explanation: parsed.explanation || '',
-      count: group.count,
-    };
+    const aiResults = Array.isArray(parsed.results) ? parsed.results : [];
+    for (const r of aiResults) {
+      const idx = typeof r.index === 'number' ? r.index : -1;
+      if (idx < 0 || idx >= groups.length) continue;
+      const group = groups[idx];
+      const confidence = (['high', 'medium', 'low'].includes(r.confidence) ? r.confidence : 'low') as 'high' | 'medium' | 'low';
+      results[idx] = {
+        counterparty: group.counterparty,
+        transaction_ids: group.transaction_ids,
+        suggested_category: r.category || 'Sonstiges',
+        is_new_category: !existingCategories.includes(r.category),
+        confidence,
+        count: group.count,
+      };
+    }
+
+    return results;
   } catch (err: any) {
-    console.error(`[AI] categorizeGroup failed for "${group.counterparty}":`, err.message || err);
-    return {
-      counterparty: group.counterparty,
-      transaction_ids: group.transaction_ids,
-      suggested_category: 'Sonstiges',
-      is_new_category: false,
-      confidence: 'low',
-      rule_pattern: group.counterparty || '',
-      rule_match_type: 'keyword',
-      rule_match_field: 'counterparty',
-      explanation: `KI-Analyse fehlgeschlagen: ${err.message || 'Unbekannter Fehler'}`,
-      count: group.count,
-    };
+    console.error(`[AI] categorizeGroups failed:`, err.message || err);
+    return groups.map(g => makeFallback(g));
   }
 }
 
@@ -391,13 +445,13 @@ ${vbConfig}
 ${csvSample}`;
 }
 
-export async function generateTemplateConfig(csvSample: string): Promise<BankTemplateConfig> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+export async function generateTemplateConfig(csvSample: string, userId: string): Promise<BankTemplateConfig> {
+  const apiKey = await getApiKeyForUser(userId);
   if (!apiKey) {
-    throw new Error('OPENROUTER_API_KEY nicht konfiguriert. Bitte in .env setzen.');
+    throw new Error('Kein OpenRouter API-Key konfiguriert. Bitte in den Einstellungen hinterlegen.');
   }
 
-  const model = await getModel();
+  const model = await getModelForUser(userId);
   const zdr = await isZdrSupported(model);
   const prompt = buildTemplatePrompt(csvSample);
   const parsed = await callWithRetry(apiKey, model, prompt, zdr);
@@ -430,13 +484,13 @@ export async function generateTemplateConfig(csvSample: string): Promise<BankTem
   return parsed as BankTemplateConfig;
 }
 
-export async function suggestCategoryPattern(context: SuggestContext): Promise<SuggestResult> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+export async function suggestCategoryPattern(context: SuggestContext, userId: string): Promise<SuggestResult> {
+  const apiKey = await getApiKeyForUser(userId);
   if (!apiKey) {
-    throw new Error('OPENROUTER_API_KEY not configured');
+    throw new Error('Kein OpenRouter API-Key konfiguriert. Bitte in den Einstellungen hinterlegen.');
   }
 
-  const model = await getModel();
+  const model = await getModelForUser(userId);
   const zdr = await isZdrSupported(model);
 
   const prompt = `Du bist ein Experte für Banktransaktions-Kategorisierung. Analysiere diese Transaktion und schlage ein Muster vor, das ähnliche Transaktionen automatisch der Kategorie "${context.category}" zuordnet.

@@ -1,39 +1,53 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { createTestApp, api, cleanDatabase, seedAccount, seedTransaction, seedCategory, seedRule } from './helpers.js';
+import { prisma } from '../prisma.js';
 
 beforeAll(async () => { await createTestApp(); });
 beforeEach(async () => { await cleanDatabase(); });
 
-describe('DELETE /api/reset', () => {
-  it('clears all user data and re-seeds defaults', async () => {
+describe('DELETE /api/account', () => {
+  it('deletes all user data and the user account', async () => {
     // Seed some data
     const account = await seedAccount();
     await seedTransaction(account.id);
     await seedCategory('Custom Category');
     await seedRule({ category: 'Custom Category', pattern: 'TEST' });
 
-    // Reset
-    const res = await api().delete('/api/reset');
+    // Delete account
+    const res = await api().delete('/api/account');
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
 
-    // Verify accounts are gone
-    const accountsRes = await api().get('/api/accounts');
-    expect(accountsRes.body).toHaveLength(0);
+    // Verify user is gone
+    const user = await prisma.user.findUnique({ where: { id: 'test-user-id' } });
+    expect(user).toBeNull();
 
-    // Verify transactions are gone
-    const txRes = await api().get('/api/transactions');
-    expect(txRes.body).toHaveLength(0);
+    // Verify all user data is gone
+    const accounts = await prisma.bankAccount.findMany({ where: { userId: 'test-user-id' } });
+    expect(accounts).toHaveLength(0);
 
-    // Verify default categories were re-seeded
-    const catsRes = await api().get('/api/categories');
-    expect(catsRes.body.length).toBeGreaterThan(10);
-    expect(catsRes.body).toContain('Lebensmittel');
-    expect(catsRes.body).toContain('Sonstiges');
+    const transactions = await prisma.transaction.count();
+    expect(transactions).toBe(0);
 
-    // Verify default rules were re-seeded
-    const rulesRes = await api().get('/api/category-rules');
-    expect(rulesRes.body.length).toBeGreaterThan(10);
-    expect(rulesRes.body.every((r: any) => r.is_default)).toBe(true);
+    const categories = await prisma.category.findMany({ where: { userId: 'test-user-id' } });
+    expect(categories).toHaveLength(0);
+
+    const rules = await prisma.categoryRule.findMany({ where: { userId: 'test-user-id' } });
+    expect(rules).toHaveLength(0);
+
+    const settings = await prisma.setting.findMany({ where: { userId: 'test-user-id' } });
+    expect(settings).toHaveLength(0);
+
+    // Re-create user for other tests
+    await prisma.user.create({
+      data: {
+        id: 'test-user-id',
+        name: 'Test User',
+        email: 'test@example.com',
+        emailVerified: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
   });
 });

@@ -3,7 +3,7 @@ import { chat, toolDefinition, toServerSentEventsResponse } from '@tanstack/ai';
 import { createOpenaiChat } from '@tanstack/ai-openai';
 import { z } from 'zod';
 import { prisma } from './prisma.js';
-import { getModelForUser, OPENROUTER_BASE, hasApiKey } from './ai.js';
+import { getModelForUser, getApiKeyForUser, OPENROUTER_BASE } from './ai.js';
 
 const chatRouter = Router();
 
@@ -29,10 +29,28 @@ function str(v: unknown): string | undefined {
   return String(v);
 }
 
-function accountFilterSql(params: any[], opts: { account_id?: string }, userId: string): string {
+async function resolveGroupAccountIds(group_id: string, userId: string): Promise<number[] | undefined> {
+  const accounts = await prisma.bankAccount.findMany({
+    where: { group_id: parseInt(group_id), userId },
+    select: { id: true },
+  });
+  return accounts.length > 0 ? accounts.map(a => a.id) : undefined;
+}
+
+async function accountFilterSql(params: any[], opts: { account_id?: string; group_id?: string }, userId: string): Promise<string> {
   let sql = ' AND a.userId = ?';
   params.push(userId);
-  if (opts.account_id) {
+
+  if (opts.group_id) {
+    const ids = await resolveGroupAccountIds(opts.group_id, userId);
+    if (ids && ids.length > 0) {
+      sql += ` AND t.account_id IN (${ids.map(() => '?').join(',')})`;
+      params.push(...ids);
+    } else {
+      // Group has no accounts — return no results
+      sql += ' AND 1=0';
+    }
+  } else if (opts.account_id) {
     sql += ' AND t.account_id = ?';
     params.push(parseInt(opts.account_id));
   } else {
@@ -59,6 +77,7 @@ function buildTools(userId: string) {
       counterparty: z.any().optional().describe('Name des Zahlungsempfaengers/Auftraggebers'),
       limit: z.any().optional().describe('Max. Anzahl Ergebnisse (Standard 20, Max 50)'),
       account_id: z.any().optional().describe('Bestimmtes Bankkonto (ID)'),
+      group_id: z.any().optional().describe('Kontogruppen-ID (filtert auf alle Konten der Gruppe)'),
     }),
   });
 
@@ -67,6 +86,7 @@ function buildTools(userId: string) {
       const year = str(raw.year);
       const month = str(raw.month);
       const account_id = str(raw.account_id);
+      const group_id = str(raw.group_id);
       const category = str(raw.category);
       const direction = str(raw.direction);
       const search = str(raw.search);
@@ -76,7 +96,7 @@ function buildTools(userId: string) {
       const params: any[] = [];
       let sql = `SELECT t.id, t.bu_date, t.amount, t.direction, t.counterparty, t.description, t.category, a.bank as bank_name
         FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE 1=1`;
-      sql += accountFilterSql(params, { account_id }, userId);
+      sql += await accountFilterSql(params, { account_id, group_id }, userId);
       if (year) { sql += " AND strftime('%Y', t.bu_date) = ?"; params.push(year); }
       if (month) { sql += " AND strftime('%m', t.bu_date) = ?"; params.push(month.padStart(2, '0')); }
       if (category) { sql += ' AND t.category = ?'; params.push(category); }
@@ -101,6 +121,7 @@ function buildTools(userId: string) {
     inputSchema: z.object({
       year: z.any().optional().describe('Jahr filtern (z.B. 2025)'),
       account_id: z.any().optional().describe('Bestimmtes Bankkonto (ID)'),
+      group_id: z.any().optional().describe('Kontogruppen-ID (filtert auf alle Konten der Gruppe)'),
     }),
   });
 
@@ -108,13 +129,14 @@ function buildTools(userId: string) {
     try {
       const year = str(raw.year);
       const account_id = str(raw.account_id);
+      const group_id = str(raw.group_id);
       const params: any[] = [];
       let sql = `SELECT strftime('%Y-%m', t.bu_date) as month,
         SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) as income,
         SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) as expenses,
         COUNT(*) as count
         FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE 1=1`;
-      sql += accountFilterSql(params, { account_id }, userId);
+      sql += await accountFilterSql(params, { account_id, group_id }, userId);
       if (year) { sql += " AND strftime('%Y', t.bu_date) = ?"; params.push(year); }
       sql += ' GROUP BY month ORDER BY month ASC';
       console.log('[Chat Tool] getMonthlyAnalysis:', { year });
@@ -135,6 +157,7 @@ function buildTools(userId: string) {
       month: z.any().optional().describe('Monat als Zahl (1-12)'),
       direction: z.any().optional().describe('debit=Ausgaben, credit=Einnahmen. Standard: debit'),
       account_id: z.any().optional().describe('Bestimmtes Bankkonto (ID)'),
+      group_id: z.any().optional().describe('Kontogruppen-ID (filtert auf alle Konten der Gruppe)'),
     }),
   });
 
@@ -144,11 +167,12 @@ function buildTools(userId: string) {
       const month = str(raw.month);
       const direction = str(raw.direction) || 'debit';
       const account_id = str(raw.account_id);
+      const group_id = str(raw.group_id);
       const params: any[] = [direction];
       let sql = `SELECT t.category, SUM(t.amount) as total, COUNT(*) as count
         FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id
         WHERE t.direction = ?`;
-      sql += accountFilterSql(params, { account_id }, userId);
+      sql += await accountFilterSql(params, { account_id, group_id }, userId);
       if (year) { sql += " AND strftime('%Y', t.bu_date) = ?"; params.push(year); }
       if (month) { sql += " AND strftime('%m', t.bu_date) = ?"; params.push(month.padStart(2, '0')); }
       sql += ' GROUP BY t.category ORDER BY total DESC';
@@ -167,19 +191,21 @@ function buildTools(userId: string) {
     description: 'Gibt eine Gesamtuebersicht: Anzahl Transaktionen, Gesamteinnahmen, Gesamtausgaben, Zeitraum.',
     inputSchema: z.object({
       account_id: z.any().optional().describe('Bestimmtes Bankkonto (ID)'),
+      group_id: z.any().optional().describe('Kontogruppen-ID (filtert auf alle Konten der Gruppe)'),
     }),
   });
 
   const getSummary = getSummaryDef.server(async (raw: any) => {
     try {
       const account_id = str(raw.account_id);
+      const group_id = str(raw.group_id);
       const params: any[] = [];
       let sql = `SELECT COUNT(*) as total_transactions,
         SUM(CASE WHEN t.direction='credit' THEN t.amount ELSE 0 END) as total_income,
         SUM(CASE WHEN t.direction='debit' THEN t.amount ELSE 0 END) as total_expenses,
         MIN(t.bu_date) as earliest, MAX(t.bu_date) as latest
         FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id WHERE 1=1`;
-      sql += accountFilterSql(params, { account_id }, userId);
+      sql += await accountFilterSql(params, { account_id, group_id }, userId);
       console.log('[Chat Tool] getSummary');
       const rows: any[] = await prisma.$queryRawUnsafe(sql, ...params);
       const row = serialize(rows)[0] || {};
@@ -207,9 +233,11 @@ function buildTools(userId: string) {
     try {
       console.log('[Chat Tool] getAccounts');
       const rows: any[] = await prisma.$queryRawUnsafe(
-        `SELECT a.id, a.name, a.bank, a.iban, a.account_type, a.is_active,
-          COUNT(t.id) as tx_count
-        FROM bank_accounts a LEFT JOIN transactions t ON t.account_id = a.id
+        `SELECT a.id, a.name, a.bank, a.iban, a.account_type, a.is_active, a.group_id,
+          g.name as group_name, COUNT(t.id) as tx_count
+        FROM bank_accounts a
+        LEFT JOIN transactions t ON t.account_id = a.id
+        LEFT JOIN account_groups g ON a.group_id = g.id
         WHERE a.userId = ?
         GROUP BY a.id ORDER BY a.bank, a.name`,
         userId,
@@ -228,6 +256,7 @@ function buildTools(userId: string) {
     inputSchema: z.object({
       year: z.any().optional().describe('Jahr (z.B. 2025)'),
       account_id: z.any().optional().describe('Bestimmtes Bankkonto (ID)'),
+      group_id: z.any().optional().describe('Kontogruppen-ID (filtert auf alle Konten der Gruppe)'),
     }),
   });
 
@@ -235,11 +264,12 @@ function buildTools(userId: string) {
     try {
       const year = str(raw.year);
       const account_id = str(raw.account_id);
+      const group_id = str(raw.group_id);
       const params: any[] = [];
       let sql = `SELECT t.category, strftime('%Y-%m', t.bu_date) as month, SUM(t.amount) as total, COUNT(*) as count
         FROM transactions t INNER JOIN bank_accounts a ON t.account_id = a.id
         WHERE t.direction = 'debit'`;
-      sql += accountFilterSql(params, { account_id }, userId);
+      sql += await accountFilterSql(params, { account_id, group_id }, userId);
       if (year) { sql += " AND strftime('%Y', t.bu_date) = ?"; params.push(year); }
       sql += ' GROUP BY t.category, month ORDER BY t.category, month';
       console.log('[Chat Tool] getCategoryMonthly:', { year });
@@ -251,7 +281,55 @@ function buildTools(userId: string) {
     }
   });
 
-  // 7. updateCategory
+  // 7. getAccountGroups
+  const getAccountGroupsDef = toolDefinition({
+    name: 'getAccountGroups',
+    description: 'Listet alle Kontogruppen des Nutzers auf, inkl. zugehoerige Konten und Transaktionsanzahl.',
+    inputSchema: z.object({}).passthrough(),
+  });
+
+  const getAccountGroups = getAccountGroupsDef.server(async () => {
+    try {
+      console.log('[Chat Tool] getAccountGroups');
+      const groups = await prisma.accountGroup.findMany({
+        where: { userId },
+        include: { accounts: true },
+        orderBy: { name: 'asc' },
+      });
+
+      const allAccountIds = groups.flatMap(g => g.accounts.map(a => a.id));
+      let txCounts: Record<number, number> = {};
+      if (allAccountIds.length > 0) {
+        const rows: any[] = await prisma.$queryRawUnsafe(
+          `SELECT account_id, COUNT(*) as count FROM transactions WHERE account_id IN (${allAccountIds.map(() => '?').join(',')}) GROUP BY account_id`,
+          ...allAccountIds,
+        );
+        for (const r of rows) txCounts[Number(r.account_id)] = Number(r.count);
+      }
+
+      return {
+        groups: groups.map(g => ({
+          id: g.id,
+          name: g.name,
+          account_type: g.account_type,
+          is_active: g.is_active,
+          accounts: g.accounts.map(a => ({
+            id: a.id,
+            name: a.name,
+            bank: a.bank,
+            iban: a.iban,
+            transaction_count: txCounts[a.id] || 0,
+          })),
+          transaction_count: g.accounts.reduce((sum, a) => sum + (txCounts[a.id] || 0), 0),
+        })),
+      };
+    } catch (err: any) {
+      console.error('[Chat Tool] getAccountGroups error:', err.message);
+      return { groups: [], error: err.message };
+    }
+  });
+
+  // 8. updateCategory
   const updateCategoryDef = toolDefinition({
     name: 'updateCategory',
     description: 'Aendert die Kategorie fuer eine oder mehrere Transaktionen. Nur existierende Kategorien verwenden. Zuerst queryTransactions aufrufen um die IDs zu ermitteln.',
@@ -313,7 +391,7 @@ function buildTools(userId: string) {
     }
   });
 
-  return [queryTransactions, getMonthlyAnalysis, getCategoryBreakdown, getSummary, getAccounts, getCategoryMonthly, updateCategory];
+  return [queryTransactions, getMonthlyAnalysis, getCategoryBreakdown, getSummary, getAccounts, getCategoryMonthly, getAccountGroups, updateCategory];
 }
 
 // ── System prompt ───────────────────────────────────────────────────
@@ -335,6 +413,7 @@ Deine Faehigkeiten:
 - Ausgaben nach Kategorien aufschluesseln
 - Gesamtuebersicht ueber alle Finanzdaten geben
 - Bankkonten auflisten
+- Kontogruppen auflisten und nach Gruppen filtern
 - Kategorie-Trends ueber Zeit zeigen
 - Kategorien von Transaktionen aendern (nur existierende Kategorien)
 
@@ -350,6 +429,7 @@ Regeln:
 - Uebergib year und month IMMER als Strings an die Tools (z.B. "2025", "7")
 - Vor einer Kategorie-Aenderung: zuerst die Transaktionen mit queryTransactions suchen um die IDs zu ermitteln, dann updateCategory mit den IDs aufrufen
 - Nach einer Kategorie-Aenderung: bestaetigen welche Transaktionen geaendert wurden
+- Wenn der Nutzer nach einer Kontogruppe fragt, verwende getAccountGroups um die Gruppen-ID zu ermitteln, dann filtere mit group_id
 
 Formatierung (Markdown):
 - Deine Antworten werden als Markdown gerendert — nutze das aktiv
@@ -365,8 +445,9 @@ Formatierung (Markdown):
 chatRouter.post('/chat', async (req: Request, res: Response) => {
   const userId = (req as any).userId as string;
 
-  if (!hasApiKey()) {
-    res.status(400).json({ error: 'Kein OpenRouter API-Key konfiguriert. Bitte OPENROUTER_API_KEY in .env setzen.' });
+  const apiKey = await getApiKeyForUser(userId);
+  if (!apiKey) {
+    res.status(400).json({ error: 'Kein OpenRouter API-Key konfiguriert. Bitte in den Einstellungen hinterlegen.' });
     return;
   }
 
@@ -378,7 +459,6 @@ chatRouter.post('/chat', async (req: Request, res: Response) => {
     }
 
     const model = await getModelForUser(userId);
-    const apiKey = process.env.OPENROUTER_API_KEY!;
 
     console.log('[Chat] Request from user', userId, '| model:', model, '| messages:', messages.length);
 
